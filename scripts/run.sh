@@ -31,10 +31,20 @@ fi
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
+  # 只为「尚未在环境中设置」的键赋 .env 的值：调用方显式传入的环境变量优先。
+  # 原先这里是无条件 `set -a; source .env`，会反过来覆盖调用方的显式变量，
+  # 导致 `CLOUD_ENABLED=true bash scripts/run.sh` 这类临时覆盖完全失效。
+  # Python 侧 edge_cloud_agent/__init__.py 的 load_dotenv(override=False) 采用同样语义。
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # 跳过空行与注释行
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # 已显式设置则不覆盖
+    [[ -n "${!key+set}" ]] && continue
+    export "${key}=${line#*=}"
+  done < .env
 fi
 
 echo "[run.sh] python   = $("${PYTHON}" -V 2>&1)"

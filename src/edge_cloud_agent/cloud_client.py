@@ -24,6 +24,13 @@ class CloudClient:
         self.logger = logging.getLogger("cloud_client")
 
     def complete(self, messages: list[dict]) -> CloudResult:
+        api_base = (self.cfg.api_base or "").strip().rstrip("/")
+        if not api_base:
+            raise RuntimeError(
+                "CLOUD_API_BASE 未配置。启用云端（CLOUD_ENABLED=true）时必须显式指定 "
+                "OpenAI 兼容接口地址。"
+            )
+
         headers = {
             "Content-Type": "application/json",
         }
@@ -38,7 +45,7 @@ class CloudClient:
         }
 
         resp = requests.post(
-            f"{self.cfg.api_base}/chat/completions",
+            f"{api_base}/chat/completions",
             headers=headers,
             data=json.dumps(payload),
             timeout=self.cfg.timeout_seconds,

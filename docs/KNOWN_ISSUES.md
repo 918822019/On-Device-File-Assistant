@@ -110,6 +110,95 @@ if mode in {"", "none", "no", "off", "false", "0"}:
 
 ---
 
+## R7. `.env` 从未被 Python 代码加载（只有 `scripts/run.sh` 会 source）
+
+**原现象**：`python-dotenv` 在 requirements.txt 里声明并已安装，但**全 src 无任何 import**。
+`.env` 仅由 `scripts/run.sh` 的 `source .env` 注入。而 README 第 4 节教的主启动方式是直接跑：
+
+```bash
+cp .env.example .env
+export PYTHONPATH=src
+uvicorn edge_cloud_agent.main:app --host 0.0.0.0 --port 9000
+```
+
+照此启动时 `.env` **完全被忽略**。实测：`EdgeConfig().model_id` 得到代码硬编码默认值
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`，而非 `.env` 里配置的 `google/gemma-4-E2B-it`——
+即按 README 操作会直接掉进 R1 那条坏掉的量化路径。
+
+**修复方式**：在 `edge_cloud_agent/__init__.py` 调用 `load_dotenv(repo_root/".env", override=False)`。
+放在包 `__init__.py` 是必须的——因为 config.py 的默认值在 import 时绑定（见 O6），
+dotenv 必须早于任何子模块 import 注入。现在 uvicorn / make run / pytest / 直接 import
+四种入口都能读到 `.env`。
+
+**验证**：不经 run.sh 直接 import，`EdgeConfig.model_id` 正确得到 E2B；
+显式设置的环境变量仍优先于 `.env`（`override=False` 语义）。
+
+---
+
+## R8. `scripts/run.sh` 无条件 source `.env`，覆盖调用方显式环境变量
+
+**原现象**：`set -a; source .env; set +a` 会用 `.env` 里的值**覆盖**调用方传入的环境变量，
+优先级与惯例相反。导致 `CLOUD_ENABLED=true bash scripts/run.sh` 这类临时覆盖完全失效——
+排查 O3 时正是被这一点误导，一度以为云端已被调用。
+
+**修复方式**：改为逐行读取 `.env`，仅对「尚未在环境中设置」的键赋值，跳过空行/注释/非法键名，
+与 Python 侧 `load_dotenv(override=False)` 保持同一语义。
+
+**验证**：`CLOUD_ENABLED=true CLOUD_API_BASE=... bash scripts/run.sh` 现在能把覆盖值送进服务进程。
+
+---
+
+## R9. `_edge_only()` 丢弃 reason 参数，硬编码返回 `"edge_ok"`
+
+**原现象**：路由判定应走云端但 `CLOUD_ENABLED=false` 时，`ask()` 调
+`_edge_only(messages, reason=decision.reason)`，而该函数成功分支把 reason 硬编码成 `"edge_ok"`，
+真实的路由判定（`policy_force_cloud_first` / `policy_tiny_disabled`）被丢弃。
+响应因此无法反映「本来想去云端」这一事实——这正是 R7/R8 排查过程中误判的直接原因。
+
+**修复方式**：透传为 `f"{reason}_edge_only"`，异常分支透传为 `f"{reason}_edge_error"`，
+并在改由端侧应答时打一条 warning 说明云端未启用。
+
+---
+
+## R10. 云端调用缺少异常保护，兜底路径自己会变成 HTTP 500
+
+**原现象**（即原 O3）：两个问题叠加。
+
+1. `CLOUD_API_BASE` 默认值 `http://127.0.0.1:8000/v1` 指向**本机 8000 端口**，
+   该端口在本机被 `arxiv_fetcher.web:app` 占用。实测
+   `POST http://127.0.0.1:8000/v1/chat/completions` → **404**，
+   其真实路由是 `/api/search`、`/api/paper/{id}` 等，无任何 OpenAI 兼容端点
+2. `agent.py` 的 `_ask_cloud` 与 `_call_cloud` 外层**没有 try/except**，
+   `cloud_client.py` 的 `resp.raise_for_status()` 抛出的 `HTTPError` 一路冒泡到
+   `main.py` 的全局兜底 handler
+
+结果：启用 `CLOUD_ENABLED=true` 而地址不对时，`/v1/chat` 从「200 + 降级文案」
+**退化成 HTTP 500 `internal_error`**，比不开云端更糟。这与 R1 是同一种模式：
+**回退路径自己没有被保护**，于是回退机制在真正需要它时失效。
+
+**修复方式**：
+
+- `cloud_client.py`：`api_base` 为空时抛出带明确指引的 `RuntimeError`（不再拼出畸形 URL）；
+  并 strip 尾部 `/` 避免出现 `//chat/completions`
+- `agent.py`：`_call_cloud` 捕获所有异常返回 `None` 并记 warning；`_ask_cloud` 在云端失败时
+  依次回退——已有端侧结果则保留 → 否则再试端侧推理 → 都不行才返回
+  `used_source="none"`、`model=""` 的诚实降级提示（新增 `_cloud_unavailable_msg`）
+- `config.py`：`CLOUD_API_BASE` 默认值改为空字符串，强制显式配置
+
+**验证**（云端指向 arxiv-fetcher，即必然 404）：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `force_cloud=true` + 端侧可用 | HTTP 500 | HTTP 200，`cloud_failed_edge_fallback`，返回端侧真实回答 |
+| 云端失败 + 端侧已答但低置信 | HTTP 500 | HTTP 200，`edge_low_confidence_cloud_failed_kept_edge`，保留端侧结果 |
+| 云端失败 + 端侧也不可用 | HTTP 500 | HTTP 200，`used_source="none"`、`model=""`、明确提示 |
+| 云端关闭（基线） | `edge_ok` | `edge_ok`，行为不变 |
+
+服务端 0 个 5xx、0 个未处理异常；云端失败降为一条 warning：
+`云端调用失败 api_base='http://127.0.0.1:8000/v1' model='': 404 Client Error`。
+
+---
+
 # 二、未修复
 
 ## O1. transformers 5.x 的 SDPA 在 MPS 上产出 NaN 且非确定性 ⚠️ 最重要
@@ -167,27 +256,6 @@ if mode in {"", "none", "no", "off", "false", "0"}:
 
 ---
 
-## O3. `CLOUD_API_BASE` 默认指向 localhost:8000，且云端调用缺少异常保护
-
-两个问题叠加：
-
-1. 默认值 `http://127.0.0.1:8000/v1` 指向**本机 8000 端口**，而该端口在本机被
-   `arxiv_fetcher.web:app` 占用。实测 `POST http://127.0.0.1:8000/v1/chat/completions` → **404**，
-   其真实路由是 `/api/search`、`/api/paper/{id}` 等，无任何 OpenAI 兼容端点
-2. `agent.py` 的 `_ask_cloud`（48 行）与 `_call_cloud`（141-142 行）外层**没有 try/except**，
-   `cloud_client.py` 的 `resp.raise_for_status()` 抛出的 `HTTPError` 会一路冒泡到
-   `main.py:225` 的全局兜底 handler
-
-结果：启用 `CLOUD_ENABLED=true` 而地址不对时，`/v1/chat` 会从「200 + 固定文案」
-**退化成 HTTP 500 `internal_error`**，比不开云端更糟。
-
-这与 R1 是同一种模式：**回退路径自己没有被保护**，于是回退机制在真正需要它时失效。
-
-建议：给 `_call_cloud` 加异常保护，失败时返回明确的降级结果而非抛出；
-并把 `CLOUD_API_BASE` 默认值改为空字符串，强制使用者显式配置。
-
----
-
 ## O4. `local_cache_dir` 双重语义冲突
 
 `EDGE_LOCAL_DIR` / `EDGE_EMBEDDING_LOCAL_DIR` 被两处代码以不同含义使用：
@@ -227,7 +295,14 @@ source: str = os.getenv("EDGE_EMBEDDING_SOURCE", "modelscope")
 影响：无法在同一进程内切换配置做多组对比测试；任何「先 import 再设环境变量」的调用方式
 都会静默拿到旧值。
 
-排查本项目配置问题时，务必在启动进程**之前**（shell 层或 `scripts/run.sh` 的 `source .env`）设好环境变量。
+排查本项目配置问题时，务必在启动进程**之前**（shell 层或 `scripts/run.sh` 的 `.env` 加载）设好环境变量。
+
+**与 R7 的关系**：正因为默认值在 import 时绑定，`load_dotenv()` 必须放在包的
+`__init__.py` 里——晚于任何子模块 import 都会失效。这也是 R7 修复方案的约束条件。
+
+**排查陷阱**：在同一进程内改 `os.environ` 后重新构造 `EdgeConfig()` 不会生效。
+做多组配置对比时必须**每组一个独立子进程**，并在 Python 启动前设好环境变量。
+（本次排查 O3 时就因此得到过一批无效结果。）
 
 ---
 

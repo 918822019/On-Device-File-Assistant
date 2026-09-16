@@ -64,12 +64,25 @@ pip install -r requirements.txt
 ## 4. 启动
 
 ```bash
-cp .env.example .env
+cp .env.example .env    # 首次
+make run
+```
+
+或者直接执行：
+
+```bash
 export PYTHONPATH=src
 uvicorn edge_cloud_agent.main:app --host 0.0.0.0 --port 9000
 ```
 
-或者直接运行脚本：`bash scripts/run.sh`
+或者：`bash scripts/run.sh`
+
+三种方式的 `.env` 都会生效——包 `__init__.py` 会 `load_dotenv(override=False)`。
+且**显式设置的环境变量优先于 `.env`**，因此可以临时覆盖而不必改文件：
+
+```bash
+CLOUD_ENABLED=true CLOUD_API_BASE=https://your-endpoint/v1 make run
+```
 
 ---
 

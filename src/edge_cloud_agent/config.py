@@ -74,7 +74,9 @@ class CloudConfig:
     """All knobs for the cloud LLM API."""
 
     enabled: bool = _env_bool("CLOUD_ENABLED", False)
-    api_base: str = os.getenv("CLOUD_API_BASE", "http://127.0.0.1:8000/v1")
+    # 默认为空，强制使用者显式配置。此前的默认值 http://127.0.0.1:8000/v1 指向本机
+    # 8000 端口，容易被其他服务占用，导致启用云端后请求打到无关服务上。
+    api_base: str = os.getenv("CLOUD_API_BASE", "")
     api_key: str = os.getenv("CLOUD_API_KEY", "")
     model: str = os.getenv("CLOUD_MODEL_ID", "google/gemma-4-e2b-it")
     timeout_seconds: int = _env_int("CLOUD_TIMEOUT_SECONDS", 20)
