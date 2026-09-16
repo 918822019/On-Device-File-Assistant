@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">文件记忆找回 Agent</string>
+    <string name="service_description">Personal file memory edge runtime service</string>
+    <string name="search_label">输入模糊线索</string>
+    <string name="search_hint">例如：上周群里发的聚餐照片</string>
+    <string name="search_btn">搜索</string>
+    <string name="clarify_btn">继续确认</string>
+    <string name="rebuild_btn">重建索引</string>
+    <string name="open_btn">打开</string>
+    <string name="share_btn">分享</string>
+    <string name="archive_btn">归档</string>
+    <string name="annotate_btn">备注</string>
+    <string name="compare_btn">对比版本</string>
+    <string name="session_label">会话ID</string>
+    <string name="default_share_to">同事</string>
+    <string name="default_note">已确认，留作证据</string>
+</resources>

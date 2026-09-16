@@ -1,0 +1,65 @@
+# ---- Python 虚拟环境 ----
+.venv/
+.venv-*/
+venv/
+env/
+
+# ---- Python 缓存与构建产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- 本地环境变量（含密钥，切勿入库；模板见 .env.example）----
+.env
+.env.local
+.env.*.local
+
+# ---- 运行时数据：向量索引、JSONL 存储、模型缓存 ----
+data/
+*.index
+*.index.ids.json
+model_cache/
+.modelscope_cache/
+
+# ---- Android / Gradle ----
+android/build/
+android/app/build/
+android/.gradle/
+android/.kotlin/
+# 内含本机 SDK 路径，Gradle 官方要求不入库
+android/local.properties
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+
+# ---- IDE ----
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf/
+.idea/tasks.xml
+.idea/httpRequests/
+**/.idea/caches/
+*.iml.bak
+
+# ---- 工具/会话产物 ----
+.omo/
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ---- 日志 ----
+*.log
+logs/
