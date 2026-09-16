@@ -64,8 +64,12 @@ flowchart LR
 
 ## 设计要点
 
-- 默认策略：端侧优先（tiny llm + int4+gp32）。
-- 云端是可选，受 `CLOUD_ENABLED` 控制。
-- `google/embeddinggemma-300m` 作为端侧 embedding 默认模型。
+- 默认策略：端侧优先，端侧 LLM 为 `google/gemma-4-E2B-it`（非量化，bfloat16）。
+  早期的 TinyLlama-1.1B + int4/gp32 量化链路已弃用（依赖 `optimum` 且需 CUDA），
+  代码保留，可通过 `EDGE_QUANTIZATION` 重新启用。
+- 云端是可选，受 `CLOUD_ENABLED` 控制；云端模型选型未定。
+- `google/embeddinggemma-300m` 作为端侧 embedding 默认模型（768 维）。
+- 设备：`EDGE_DEVICE` / `EDGE_EMBEDDING_DEVICE` 控制推理设备。Apple Silicon 上须为 `cpu`——
+  transformers 5.x 的 SDPA 在 MPS 上产出 NaN 且非确定性，详见 KNOWN_ISSUES.md。
 - 当云端关闭时，路由不会尝试云端；端侧不可用会返回明确错误提示。
 - V1 目标聚焦“报销场景”，以 `collect/search/export` 先把“用户愿意反复回来”的闭环做起来。

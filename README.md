@@ -1,18 +1,29 @@
-# 端云结合 Agent（edge-first tiny LLM）
+# 端云结合 Agent（edge-first Gemma4-E2B）
 
 本仓库实现一个“端侧优先、云端可选”的轻量 Agent：
 
-- 端侧：默认走 tiny LLM（量化推理）
-- 云端：默认不启用；如需可选则接入 Gemini/Gemma 风格的 OpenAI 兼容接口（默认模型 id 为 Gemma4-E2B）
-- 路由：命中大输入 / 指定关键词 / 强制参数时，可切到云端；也可以在配置里关闭 tiny-first。
-- 端侧新增：embedding 接口采用 `google/embeddinggemma-300m`（默认从 ModelScope 加载）
+- 端侧 LLM：`google/gemma-4-E2B-it`（Gemma4 E2B，any-to-any，权重约 9.54 GiB / bfloat16）。
+  E2B 是 Google 面向端侧的型号，本机以非量化方式在 CPU 上推理。
+- 端侧 embedding：`google/embeddinggemma-300m`（768 维，bfloat16）
+- 云端：默认不启用（`CLOUD_ENABLED=false`），云端模型选型未定。启用时走 OpenAI 兼容的
+  `/chat/completions` 接口，`CLOUD_MODEL_ID` 仅为透传给该接口的字符串。
+- 路由：命中大输入 / 指定关键词 / 强制参数时可切云端；也可在配置里关闭 edge-first。
+
+> **设备约束**：transformers 5.x 的 SDPA 在 Apple Silicon 的 MPS 上会产出 NaN 且结果
+> 非确定性（同一输入多次运行余弦值漂移），故本机 `EDGE_DEVICE` 与
+> `EDGE_EMBEDDING_DEVICE` 均固定为 `cpu`。详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
+
+> **历史说明**：早期版本端侧为 TinyLlama-1.1B + int4/gp32 量化，`gemma-4-e2b-it` 当时被
+> 配置在云端位置。该量化链路依赖 `optimum` 且在本机无 CUDA 无法工作，现已弃用；
+> 相关代码（`_QUANT_DIRECT_MODES` / `_GPTQ_MODES` 回退链）仍保留，可通过
+> `EDGE_QUANTIZATION` 重新启用。
 
 ---
 
 ## 1. 架构图（仓库级）
 
 - [src/edge_cloud_agent/config.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/config.py)：配置读取与默认值（边侧、云侧、路由策略）
-- [src/edge_cloud_agent/edge_runtime.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/edge_runtime.py)：端侧 tiny llm 加载与生成（含 int4 + gp32 回退链）
+- [src/edge_cloud_agent/edge_runtime.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/edge_runtime.py)：端侧 LLM 加载与生成（当前走非量化路径；GPTQ/BNB 回退链保留但需 `optimum` + CUDA）
 - [src/edge_cloud_agent/embedding_runtime.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/embedding_runtime.py)：端侧 embedding 模型加载与向量生成（`google/embeddinggemma-300m`）
 - [src/edge_cloud_agent/cloud_client.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/cloud_client.py)：云端 API 客户端
 - [src/edge_cloud_agent/routing.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/routing.py)：路由策略层
@@ -62,31 +73,40 @@ uvicorn edge_cloud_agent.main:app --host 0.0.0.0 --port 9000
 
 ---
 
-## 5. 关键环境变量（端侧 tiny llm 为默认）
+## 5. 关键环境变量（端侧 Gemma4-E2B 为默认）
 
 ### 通用与聊天
 
 - `EDGE_MODEL_SOURCE`：端侧来源；`hf` 或 `modelscope`
-- `EDGE_MODEL_ID`：端侧基础模型（默认：TinyLlama-1.1B-Chat）
-- `EDGE_QUANTIZED_MODEL_ID`：量化模型 ID（可放 int4 ckpt）
-- `EDGE_QUANTIZATION=int4-gp32`：量化首选策略
-- `EDGE_QUANT_BITS`：GPTQ bits（默认 4）
-- `EDGE_QUANT_GROUP_SIZE`：GPTQ group size（默认 32）
+- `EDGE_MODEL_ID`：端侧基础模型（当前：`google/gemma-4-E2B-it`）
+- `EDGE_LOCAL_DIR`：本地权重目录；设置后优先于 `EDGE_MODEL_ID` 直接加载
+- `EDGE_DEVICE`：推理设备。`auto` 交给 accelerate 决定（Apple Silicon 上会落 MPS）；
+  **本机须设为 `cpu`**，原因见文首设备约束
+- `EDGE_DTYPE`：权重精度。`auto` = 沿用模型 `config.json` 声明值（E2B 为 bfloat16）；
+  也可显式 `bfloat16` / `float16` / `float32`
+- `EDGE_QUANTIZATION`：量化策略。`none`（当前默认）= 不量化，按原生精度直接加载；
+  `int4-gp32` 等取值会进入 GPTQ/BNB 回退链，需额外安装 `optimum`，且本机无 CUDA 不可用
+- `EDGE_QUANTIZED_MODEL_ID`：量化 ckpt 的模型 ID，仅在启用量化时使用
+- `EDGE_QUANT_BITS` / `EDGE_QUANT_GROUP_SIZE`：GPTQ 参数（默认 4 / 32）
 - `CLOUD_ENABLED=false`：当前默认关闭云端兜底
-- `CLOUD_MODEL_ID`：云端模型 ID，默认 `google/gemma-4-e2b-it`
+- `CLOUD_MODEL_ID`：云端模型 ID，透传给 OpenAI 兼容接口；云端选型未定
+- `CLOUD_API_BASE`：云端接口地址。**注意默认值 `http://127.0.0.1:8000/v1` 指向本机 8000 端口**，
+  启用前务必改成真实的云端地址
 - `ROUTE_USE_TINYLLM=true`：`true` 代表端侧优先，`false` 代表云侧优先
+  （变量名沿用早期 TinyLlama 时代，现端侧为 E2B，名称已名不副实；因涉及代码改动暂未重命名）
 - `ROUTE_MAX_INPUT_CHARS`：触发云端优先的上下文长度阈值
 - `ROUTE_MIN_EDGE_CONFIDENCE`：端侧置信度低于该阈值回退云端
 
 ### embedding（端侧）
 
-- `EDGE_EMBEDDING_SOURCE=modelscope`
+- `EDGE_EMBEDDING_SOURCE`：`modelscope` 走 `snapshot_download`；其他值（如 `local`）跳过下载直接加载
 - `EDGE_EMBEDDING_MODEL_ID=google/embeddinggemma-300m`
-- `EDGE_EMBEDDING_LOCAL_DIR`：本地缓存目录（优先）
+- `EDGE_EMBEDDING_LOCAL_DIR`：本地权重目录（优先）
+- `EDGE_EMBEDDING_DEVICE`：同 `EDGE_DEVICE`，**本机须设为 `cpu`**
 - `EDGE_EMBEDDING_MAX_LENGTH`：单条文本最大长度
 - `EDGE_EMBEDDING_BATCH_SIZE`：单批向量化数量
 - `EDGE_EMBEDDING_TRUST_REMOTE_CODE`
-- `EDGE_EMBEDDING_TORCH_DTYPE`
+- `EDGE_EMBEDDING_TORCH_DTYPE`：`bfloat16`（本机验证为确定且无 NaN）/ `float16` / `float32` / `auto`
 
 ### 报销场景（V1）
 
@@ -344,21 +364,38 @@ make install
 
 ---
 
-## 9. 推荐配置（先跑通端侧）
+## 9. 推荐配置（本机 macOS / Apple Silicon 已验证）
 
 ```bash
-EDGE_QUANTIZATION=int4-gp32
+# 端侧 LLM：Gemma4-E2B，非量化，CPU
+EDGE_MODEL_SOURCE=hf
+EDGE_MODEL_ID=google/gemma-4-E2B-it
+EDGE_LOCAL_DIR=<repo>/models/google/gemma-4-E2B-it
+EDGE_QUANTIZATION=none
+EDGE_DEVICE=cpu
+EDGE_DTYPE=auto
+
+# 端侧 embedding：embeddinggemma-300m，CPU + bfloat16
+EDGE_EMBEDDING_SOURCE=local
+EDGE_EMBEDDING_MODEL_ID=google/embeddinggemma-300m
+EDGE_EMBEDDING_LOCAL_DIR=<repo>/models/google/embeddinggemma-300m
+EDGE_EMBEDDING_DEVICE=cpu
+EDGE_EMBEDDING_TORCH_DTYPE=bfloat16
+
+# 云端未定，保持关闭
 CLOUD_ENABLED=false
 ROUTE_USE_TINYLLM=true
-EDGE_EMBEDDING_SOURCE=modelscope
-EDGE_EMBEDDING_MODEL_ID=google/embeddinggemma-300m
 ```
 
-如需云端可选 Gemma4 兜底：
+权重需预先下载到 `models/`（已 gitignore）：E2B 约 9.54 GiB，embedding 模型约 1.1 GiB。
+
+云端选型确定后再启用：
 
 ```bash
 CLOUD_ENABLED=true
-CLOUD_MODEL_ID=google/gemma-4-e2b-it
+CLOUD_API_BASE=<真实的 OpenAI 兼容地址>/v1   # 默认值指向本机 8000，必须先改
+CLOUD_API_KEY=<key>
+CLOUD_MODEL_ID=<云端模型 id>
 ```
 
 ---

@@ -56,7 +56,10 @@ class EdgeEmbeddingRuntime:
             return torch.bfloat16
         if (self.cfg.torch_dtype or "").lower() in {"fp16", "float16"}:
             return torch.float16
-        return torch.float16
+        if (self.cfg.torch_dtype or "").lower() in {"fp32", "float32"}:
+            return torch.float32
+        # auto：交给 transformers 读取模型 config.json 的 dtype 字段
+        return "auto"
 
     def _load_model(self) -> None:
         resolved_model = self.model_id
@@ -77,8 +80,8 @@ class EdgeEmbeddingRuntime:
 
             self.model = AutoModel.from_pretrained(
                 resolved_model,
-                torch_dtype=self._dtype(),
-                device_map="auto",
+                dtype=self._dtype(),
+                device_map=(self.cfg.device or "auto").strip() or "auto",
                 trust_remote_code=self.cfg.trust_remote_code,
             ).eval()
             self._ready = True

@@ -68,6 +68,24 @@ class EdgeRuntime:
         cache_dir = self.cfg.local_cache_dir or "/tmp/modelscope_cache"
         return snapshot_download(model_id, cache_dir=cache_dir)
 
+    def _dtype(self):
+        """把 EDGE_DTYPE 解析为 transformers 的 dtype 参数。
+
+        auto 原样透传，由 transformers 读取模型 config.json 的 dtype 字段
+        （gemma-4-E2B 为 bfloat16）；其余取值映射到具体 torch dtype。
+        """
+        spec = (self.cfg.dtype or "auto").strip().lower()
+        if spec in {"", "auto"}:
+            return "auto"
+        if spec in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if spec in {"fp16", "float16", "half"}:
+            return torch.float16
+        if spec in {"fp32", "float32", "single"}:
+            return torch.float32
+        self.logger.warning("未知 EDGE_DTYPE=%r，回退 auto", self.cfg.dtype)
+        return "auto"
+
     def _load_model(self) -> None:
         resolved_model = self.model_id
 
@@ -95,13 +113,27 @@ class EdgeRuntime:
 
     def _load_model_with_quantization(self, model_source: str):
         mode = (self.cfg.quantization or "").strip().lower()
+        device_map = (self.cfg.device or "auto").strip() or "auto"
+        dtype = self._dtype()
 
-        if mode in self._QUANT_DIRECT_MODES and mode != "":
+        # 未启用量化：直接按模型原生精度加载，不再尝试 BNB/GPTQ。
+        # 此前该情形会无条件落入下方的 bitsandbytes int4 分支，
+        # 在无 GPU 的机器上对大模型做一次注定失败的量化尝试。
+        if mode in {"", "none", "no", "off", "false", "0"}:
+            self.logger.info("量化已关闭（EDGE_QUANTIZATION=%r），按 %s 直接加载", self.cfg.quantization, dtype)
+            return AutoModelForCausalLM.from_pretrained(
+                model_source,
+                dtype=dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+
+        if mode in self._QUANT_DIRECT_MODES:
             try:
                 return AutoModelForCausalLM.from_pretrained(
                     model_source,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
+                    dtype=dtype,
+                    device_map=device_map,
                     trust_remote_code=True,
                 )
             except Exception as exc:  # pragma: no cover
@@ -118,7 +150,7 @@ class EdgeRuntime:
                 return AutoModelForCausalLM.from_pretrained(
                     model_source,
                     quantization_config=gptq_cfg,
-                    device_map="auto",
+                    device_map=device_map,
                     trust_remote_code=True,
                 )
             except Exception as exc:  # pragma: no cover
@@ -135,16 +167,16 @@ class EdgeRuntime:
             return AutoModelForCausalLM.from_pretrained(
                 model_source,
                 quantization_config=bnb_cfg,
-                device_map="auto",
+                device_map=device_map,
                 trust_remote_code=True,
             )
         except Exception as exc:  # pragma: no cover
-            self.logger.warning("bitsandbytes int4 加载失败，回退 bf16/fp16: %s", exc)
+            self.logger.warning("bitsandbytes int4 加载失败，回退到模型原生精度: %s", exc)
 
         return AutoModelForCausalLM.from_pretrained(
             model_source,
-            torch_dtype=torch.float16,
-            device_map="auto",
+            dtype=dtype,
+            device_map=device_map,
             trust_remote_code=True,
         )
 

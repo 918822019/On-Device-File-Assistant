@@ -2,7 +2,7 @@
 
 ## 0. 目标
 
-本项目默认行为：端侧 tiny llm 优先，云端（Gemma4）可选。默认 `CLOUD_ENABLED=false`，因此先只跑端侧。
+本项目默认行为：端侧优先（`google/gemma-4-E2B-it`），云端可选但选型未定。默认 `CLOUD_ENABLED=false`，因此只跑端侧。
 
 ## 1. 安装依赖
 
@@ -12,17 +12,33 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> 需要 transformers **5.x**（4.57 及以下不认识 `gemma4` 架构）。当前 requirements.txt 钉 5.17.0。
+
+## 1.1 下载权重到 models/（已 gitignore）
+
+```bash
+# E2B 约 9.54 GiB，embedding 模型约 1.1 GiB
+hf download google/gemma-4-E2B-it --local-dir models/google/gemma-4-E2B-it
+```
+
+`google/embeddinggemma-300m` 若走 ModelScope：`snapshot_download(..., cache_dir="models")`
+会落到 `models/google/embeddinggemma-300m`。
+
 ## 2. 配置环境变量
 
 ```bash
 cp .env.example .env
 ```
 
-核心三项：
+核心几项：
 
-- `CLOUD_ENABLED=false`：先只跑端侧
+- `CLOUD_ENABLED=false`：云端未定，先只跑端侧
 - `ROUTE_USE_TINYLLM=true`：默认 edge-first
-- `EDGE_QUANTIZATION=int4-gp32`：int4+gp32 量化策略
+- `EDGE_QUANTIZATION=none`：不量化，按模型原生精度加载（量化链路需 `optimum` + CUDA，本机不可用）
+- `EDGE_DEVICE=cpu` / `EDGE_EMBEDDING_DEVICE=cpu`：**Apple Silicon 必须设 cpu**，
+  transformers 5.x 的 SDPA 在 MPS 上会产出 NaN 且结果非确定性
+- `EDGE_LOCAL_DIR` / `EDGE_EMBEDDING_LOCAL_DIR`：指向上一步下载的 `models/` 目录
+- `EDGE_EMBEDDING_TORCH_DTYPE=bfloat16`：本机验证为确定且无 NaN
 
 ## 3. 启动服务
 
@@ -75,12 +91,18 @@ curl -X POST http://127.0.0.1:9000/v1/embeddings \
 - `model`：当前使用的 embedding 模型（默认 `google/embeddinggemma-300m`）
 - `embeddings`：文本向量列表，按输入顺序返回
 
-## 7. 开启云端兜底（可选）
+## 7. 开启云端兜底（可选，选型未定）
 
 ```bash
 export CLOUD_ENABLED=true
-export CLOUD_MODEL_ID=google/gemma-4-e2b-it
+export CLOUD_API_BASE=<真实的 OpenAI 兼容地址>/v1
+export CLOUD_API_KEY=<key>
+export CLOUD_MODEL_ID=<云端模型 id>
 ```
+
+> **注意**：`CLOUD_API_BASE` 的默认值是 `http://127.0.0.1:8000/v1`，指向本机 8000 端口。
+> 若该端口被其他服务占用（例如本机的 arxiv-fetcher），启用云端后 `/v1/chat` 会因 404 且
+> `agent.py` 的云端调用缺少异常保护而返回 **HTTP 500**，比不开云端更糟。启用前务必先改地址。
 
 云端可达时，满足以下条件会走云端：
 

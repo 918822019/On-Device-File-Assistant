@@ -43,6 +43,14 @@ class EdgeConfig:
     quant_bits: int = _env_int("EDGE_QUANT_BITS", 4)
     quant_group_size: int = _env_int("EDGE_QUANT_GROUP_SIZE", 32)
     use_sampling: bool = _env_bool("EDGE_USE_SAMPLING", True)
+    # 推理设备。auto = 交给 accelerate 决定（Apple Silicon 上会落 MPS）；
+    # 也可显式指定 cpu / mps / cuda:0。
+    # 注意：transformers 5.x 的 SDPA 在 MPS 上会产出 NaN 与非确定性结果，
+    # 本机请设为 cpu，详见 docs/KNOWN_ISSUES.md。
+    device: str = os.getenv("EDGE_DEVICE", "auto")
+    # 权重精度。auto = 沿用模型 config.json 声明的 dtype（gemma-4-E2B 为 bfloat16）；
+    # 也可显式指定 bfloat16 / float16 / float32。
+    dtype: str = os.getenv("EDGE_DTYPE", "auto")
 
 
 @dataclass(frozen=True)
@@ -56,6 +64,9 @@ class EmbeddingConfig:
     batch_size: int = _env_int("EDGE_EMBEDDING_BATCH_SIZE", 8)
     trust_remote_code: bool = _env_bool("EDGE_EMBEDDING_TRUST_REMOTE_CODE", True)
     torch_dtype: str = os.getenv("EDGE_EMBEDDING_TORCH_DTYPE", "float16")
+    # 推理设备，取值同 EDGE_DEVICE。transformers 5.x 下 MPS 会导致向量
+    # 非确定性（同一输入多次运行得到不同余弦值），本机请设为 cpu。
+    device: str = os.getenv("EDGE_EMBEDDING_DEVICE", "auto")
 
 
 @dataclass(frozen=True)
