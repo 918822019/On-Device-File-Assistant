@@ -199,6 +199,69 @@ dotenv 必须早于任何子模块 import 注入。现在 uvicorn / make run / p
 
 ---
 
+## R11. `generate()` 无条件 `output_scores=True`，为每步留存全词表 logits
+
+**原现象**：`EdgeRuntime.generate()` 固定传 `output_scores=True` +
+`return_dict_in_generate=True`，于是 transformers 为**每一个**生成步保留一份
+(batch, vocab) 张量。本模型 `vocab_size=262144`，`EDGE_MAX_NEW_TOKENS=220` 时
+每请求驻留约 **220 MiB**，且随 `max_new_tokens` **线性增长**（1024 步约 1 GiB）。
+
+而唯一的消费者 `_estimate_confidence()` 只读前 6 步：
+
+```python
+window = min(6, len(scores))
+for step_scores in scores[:window]:
+```
+
+即保留了 220 步、只用 6 步。
+
+**修复方式**：改用 `_ConfidenceRecorder`（一个 logits processor），在生成过程中就地
+记录前 6 步的 max-softmax，超出窗口只做一次长度判断，不留存任何张量。
+`generate()` 不再传 `output_scores` / `return_dict_in_generate`；
+`_estimate_confidence()` 已成为死代码，一并删除。窗口大小提为类常量
+`_CONFIDENCE_WINDOW = 6`，与原实现一致。
+
+**实测收益——需要如实说明**：
+
+| 指标 | 旧实现 | 新实现 |
+|---|---|---|
+| 生成速度（预热后交替对照 4 轮） | 12.88s / 220 tok = 17.08 tok/s | 12.88s / 220 tok = 17.08 tok/s |
+| 每请求 scores 驻留 | 220 MiB | **0** |
+| confidence 数值 | — | 4 个 prompt **逐位相同**（差 `0.00e+00`） |
+| 生成文本 | — | 逐字相同 |
+
+**速度没有改善（比值 1.000）**。保留这个改动的理由是内存：端侧目标是 Android
+而非 macOS，每请求 220 MiB 的额外驻留在手机上远比为 48 GiB 的开发机重要，
+且该开销会随 `max_new_tokens` 线性放大。
+
+---
+
+### ⚠️ 排查教训：首次 `generate()` 的预热成本会伪造出巨大的性能差异
+
+本次修复的**初始动机是错的**。我先后得出「快 3.1 倍」「快 1.30 倍」两个结论，
+两者都是测量假象：
+
+| 测量方式 | 得出的结论 | 错在哪 |
+|---|---|---|
+| 进程内连续两次 generate，`output_scores=True` 排第一 | 快 3.1 倍 | 第一次调用吃满预热成本 |
+| 同上，把新实现排第一 | 快 1.30 倍 | 顺序反过来，结论就反过来了 |
+| **先预热 2 次丢弃，再交替测量 4 轮** | **0% 差异** | — |
+
+预热成本量级：**进程内第一次 `generate()` 比后续慢约 25%，且 RSS 增长约 3.6 GiB**
+（kernel 懒初始化、allocator arena 扩张、9.5 GiB 权重首次触页）。
+我曾把这 3.6 GiB 错误归因给 `output_scores`。
+
+因此，本项目任何推理性能对比都必须：
+
+1. **先预热**（跑 1–2 次短生成并丢弃结果）
+2. **交替测量**（A/B/A/B 而非 AAA/BBB），并去掉各自第一轮
+3. **多轮取均值**，单轮差值在 ±5% 内视为无差异
+
+另：`resource.getrusage().ru_maxrss` 在 macOS 上单位是**字节**，不是 KB；
+按 KB 换算会把结果放大 1024 倍（本次排查中一度把 1.1 GiB 读成 1124 GiB）。
+
+---
+
 # 二、未修复
 
 ## O1. transformers 5.x 的 SDPA 在 MPS 上产出 NaN 且非确定性 ⚠️ 最重要
@@ -344,8 +407,23 @@ ModelScope 下载的 `google/embeddinggemma-300m` 快照中，`modules.json` 声
 - `ROUTE_MAX_INPUT_CHARS=1800`（超过就试图转云端，而云端未启用）
 
 即长度略超 1800 字符的请求会被路由判定为「应走云端」，但云端关闭，
-最终仍退回端侧并给出降级提示。这些阈值需按 E2B 的实际能力与本机 CPU 推理速度重新标定
-（CPU 上生成速度实测约 1.3–4.1s/次短回答，长上下文会显著变慢）。
+最终仍退回端侧并给出降级提示。
+
+**⚠️ 修正：这些阈值不应调大。** 本机 CPU 实测 prefill 约 **30 tok/s**（64/128/256/512
+tokens 分别为 32.8/33.3/33.9/40.1 ms per token，近似线性，28 层 sliding_attention 抑制了
+O(n²)）。按此推算，`EDGE_MAX_INPUT_TOKENS=1400` 光是 prefill 就需 **约 47 秒**才吐出第一个字；
+若按模型规格调到 8192，prefill 需数分钟，请求根本不可用。
+
+也就是说 1400/220/1800 这组数字**并非「TinyLlama 时代的遗留错误」，而大致就是
+CPU 推理可承受的上限**。真正的约束是运行硬件而非模型能力——E2B 的 128K 上下文要在
+端侧 NPU/GPU（Android，见 `android/app/src/main/cpp/`）上才有意义。
+
+另：decode 实测约 17 tok/s，且 4–5 线程即饱和（1/2/4/5/8/12/15 线程分别为
+7.1/10.5/14.6/15.8/16.5/16.4/18.1 tok/s，隐含带宽 72→185 GB/s）。这说明 decode 是
+**内存带宽瓶颈**：每生成一个 token 都要把 9.51 GiB 权重完整读一遍，加线程无效，
+只有量化（减少每 token 字节数）能提速。
+
+因此本项在 macOS 开发机上**不建议调整**；迁移到 Android 端侧后应按实际 NPU 吞吐重新标定。
 
 ---
 
