@@ -1,0 +1,4 @@
+[submodule "third_party/tiny-llm"]
+	path = third_party/tiny-llm
+	url = https://github.com/918822019/tiny-llm.git
+	branch = codex/speculative-decoding
