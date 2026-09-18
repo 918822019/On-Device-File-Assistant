@@ -22,21 +22,21 @@
 
 ## 1. 架构图（仓库级）
 
-- [src/edge_cloud_agent/config.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/config.py)：配置读取与默认值（边侧、云侧、路由策略）
-- [src/edge_cloud_agent/edge_runtime.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/edge_runtime.py)：端侧 LLM 加载与生成（当前走非量化路径；GPTQ/BNB 回退链保留但需 `optimum` + CUDA）
-- [src/edge_cloud_agent/embedding_runtime.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/embedding_runtime.py)：端侧 embedding 模型加载与向量生成（`google/embeddinggemma-300m`）
-- [src/edge_cloud_agent/cloud_client.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/cloud_client.py)：云端 API 客户端
-- [src/edge_cloud_agent/routing.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/routing.py)：路由策略层
-- [src/edge_cloud_agent/agent.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/agent.py)：路由与回退策略（Edge/Cloud 编排）
-- [src/edge_cloud_agent/main.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/main.py)：FastAPI 入口，提供 `/health`、`/v1/chat`、`/v1/embeddings`
-- [src/edge_cloud_agent/routers/chat.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/routers/chat.py)：聊天路由定义
-- [src/edge_cloud_agent/routers/embeddings.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/routers/embeddings.py)：embedding 路由定义
-- [src/edge_cloud_agent/routers/expense.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/routers/expense.py)：报销场景闭环路由（收进来/找回来/拿出去）
-- [src/edge_cloud_agent/expense/storage.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/expense/storage.py)：报销材料本地持久化（本地 JSONL 存储）
-- [src/edge_cloud_agent/expense/service.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/expense/service.py)：报销工作流服务（字段抽取、检索、导出）
-- [src/edge_cloud_agent/expense/schemas.py](/Users/wzy/PycharmProjects/端云结合/src/edge_cloud_agent/expense/schemas.py)：报销场景请求与响应模型
-- [requirements.txt](/Users/wzy/PycharmProjects/端云结合/requirements.txt)：依赖
-- [.env.example](/Users/wzy/PycharmProjects/端云结合/.env.example)：环境变量模板
+- [src/edge_cloud_agent/config.py](src/edge_cloud_agent/config.py)：配置读取与默认值（边侧、云侧、路由策略）
+- [src/edge_cloud_agent/edge_runtime.py](src/edge_cloud_agent/edge_runtime.py)：端侧 LLM 加载与生成（当前走非量化路径；GPTQ/BNB 回退链保留但需 `optimum` + CUDA）
+- [src/edge_cloud_agent/embedding_runtime.py](src/edge_cloud_agent/embedding_runtime.py)：端侧 embedding 模型加载与向量生成（`google/embeddinggemma-300m`）
+- [src/edge_cloud_agent/cloud_client.py](src/edge_cloud_agent/cloud_client.py)：云端 API 客户端
+- [src/edge_cloud_agent/routing.py](src/edge_cloud_agent/routing.py)：路由策略层
+- [src/edge_cloud_agent/agent.py](src/edge_cloud_agent/agent.py)：路由与回退策略（Edge/Cloud 编排）
+- [src/edge_cloud_agent/main.py](src/edge_cloud_agent/main.py)：FastAPI 入口，提供 `/health`、`/v1/chat`、`/v1/embeddings`
+- [src/edge_cloud_agent/routers/chat.py](src/edge_cloud_agent/routers/chat.py)：聊天路由定义
+- [src/edge_cloud_agent/routers/embeddings.py](src/edge_cloud_agent/routers/embeddings.py)：embedding 路由定义
+- [src/edge_cloud_agent/routers/expense.py](src/edge_cloud_agent/routers/expense.py)：报销场景闭环路由（收进来/找回来/拿出去）
+- [src/edge_cloud_agent/expense/storage.py](src/edge_cloud_agent/expense/storage.py)：报销材料本地持久化（本地 JSONL 存储）
+- [src/edge_cloud_agent/expense/service.py](src/edge_cloud_agent/expense/service.py)：报销工作流服务（字段抽取、检索、导出）
+- [src/edge_cloud_agent/expense/schemas.py](src/edge_cloud_agent/expense/schemas.py)：报销场景请求与响应模型
+- [requirements.txt](requirements.txt)：依赖
+- [.env.example](.env.example)：环境变量模板
 
 ---
 
@@ -372,8 +372,8 @@ make install
 
 - 查看文档与排障
 
-- [docs/QUICKSTART.md](/Users/wzy/PycharmProjects/端云结合/docs/QUICKSTART.md)
-- [docs/ARCHITECTURE.md](/Users/wzy/PycharmProjects/端云结合/docs/ARCHITECTURE.md)
+- [docs/QUICKSTART.md](docs/QUICKSTART.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
 

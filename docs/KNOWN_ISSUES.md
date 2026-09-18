@@ -390,7 +390,7 @@ ModelScope 下载的 `google/embeddinggemma-300m` 快照中，`modules.json` 声
 该值一路传到响应的 `used_model` 字段：
 
 ```
-"used_model": "/Users/wzy/.../models/google/gemma-4-E2B-it"
+"used_model": "<repo>/models/google/gemma-4-E2B-it"
 ```
 
 泄露本机绝对路径，且调用方无法据此识别实际模型。建议响应中改填 `cfg.model_id`。

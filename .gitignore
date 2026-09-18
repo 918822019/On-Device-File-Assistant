@@ -49,16 +49,17 @@ android/local.properties
 !debug.keystore
 
 # ---- IDE ----
-.idea/workspace.xml
-.idea/usage.statistics.xml
-.idea/shelf/
-.idea/tasks.xml
-.idea/httpRequests/
-**/.idea/caches/
+.idea/
 *.iml.bak
 
 # ---- 工具/会话产物 ----
 .omo/
+
+# tiny-llm 工具链的中间产物。make_fake_qwen35_model.py 之类会把 HF state_dict
+# 写到**当前工作目录**（--hf-out 的默认值），在仓库根跑就会落一个 fake35_hf.pt。
+# .tqwen 是导出后的模型二进制，同样不该入库。
+*.tqwen
+fake*_hf.pt
 
 # ---- macOS ----
 .DS_Store
