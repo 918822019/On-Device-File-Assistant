@@ -118,7 +118,7 @@ reply ─► _filter_candidates_by_reply 三路保留:
 - session 在内存 `_sessions`（读写均持 `_session_lock`），`search_id` 即 `session_id`。
 - 全链路事件：`search.started → candidate_pool → scored → completed →
   clarify.started → filtered → completed → action.*`，trace_id 贯穿，
-  响应头 `x-trace-id` 回传。日志字典见 README §5.1。
+  响应头 `x-trace-id` 回传。日志字典见 [API.md](API.md)。
 
 ---
 
@@ -148,8 +148,8 @@ reply ─► _filter_candidates_by_reply 三路保留:
 - watch 目录中 pdf/图片读不出文本属预期跳过（不计 error）。
 - `ExpenseStore.from_dict` 容错构造：历史 JSONL 字段增减不整行丢弃。
 
-复盘指标（README §7 定义，尚未有代码采集）：14 天回访率、1 小时补齐率、
-字段纠正次数。
+复盘指标（README「产品目标与复盘指标」一节定义，尚未有代码采集）：14 天回访率、
+1 小时补齐率、字段纠正次数。
 
 ---
 

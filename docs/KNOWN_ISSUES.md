@@ -113,7 +113,7 @@ if mode in {"", "none", "no", "off", "false", "0"}:
 ## R7. `.env` 从未被 Python 代码加载（只有 `scripts/run.sh` 会 source）
 
 **原现象**：`python-dotenv` 在 requirements.txt 里声明并已安装，但**全 src 无任何 import**。
-`.env` 仅由 `scripts/run.sh` 的 `source .env` 注入。而 README 第 4 节教的主启动方式是直接跑：
+`.env` 仅由 `scripts/run.sh` 的 `source .env` 注入。而 README（当时版本）教的主启动方式是直接跑：
 
 ```bash
 cp .env.example .env
