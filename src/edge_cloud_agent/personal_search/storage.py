@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -69,10 +70,22 @@ class PersonalFileStore:
         self._lock = Lock()
         self._load()
 
-    def add_or_update(self, item: PersonalFileItem) -> None:
+    def add_or_update(self, item: PersonalFileItem, persist: bool = True) -> None:
+        """写入内存索引；persist=False 时延迟落盘（批量导入场景配合 flush 使用）。"""
+
         with self._lock:
             self._items[item.file_id] = item
             self._by_file_uri[item.file_uri] = item.file_id
+            if persist:
+                self._persist()
+
+    def flush(self) -> None:
+        """将当前内存索引一次性落盘。
+
+        此前每条 add_or_update 都全量重写 JSONL，扫描导入 N 个文件 = N 次全量写（O(N^2)）。
+        """
+
+        with self._lock:
             self._persist()
 
     def get(self, file_id: str) -> PersonalFileItem | None:
@@ -95,14 +108,15 @@ class PersonalFileStore:
                 result.append(material)
         return result
 
-    def delete_by_file_uri(self, file_uri: str) -> bool:
+    def delete_by_file_uri(self, file_uri: str, persist: bool = True) -> bool:
         with self._lock:
             file_id = self._by_file_uri.get(file_uri)
             if file_id is None:
                 return False
             del self._by_file_uri[file_uri]
             self._items.pop(file_id, None)
-            self._persist()
+            if persist:
+                self._persist()
             return True
 
     def _load(self) -> None:
@@ -125,8 +139,12 @@ class PersonalFileStore:
                     continue
 
     def _persist(self) -> None:
+        """原子落盘：先写临时文件再 os.replace，进程中途崩溃不会留下半截 JSONL。"""
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as file:
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as file:
             for item in self._items.values():
                 file.write(json.dumps(item.to_dict(), ensure_ascii=False))
                 file.write("\n")
+        os.replace(tmp_path, self.path)

@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from ..config import PersonalFileConfig
 from ..embedding_runtime import EdgeEmbeddingRuntime
+from ..text_utils import tokenize as _tokenize
 from .storage import PersonalFileItem, PersonalFileStore
 from .schemas import FileSearchCandidate
 from .vector_index import PersonalFileVectorIndex
@@ -90,17 +91,7 @@ def _to_dt(value: str | None) -> datetime | None:
         return None
 
 
-def _tokenize(query: str) -> list[str]:
-    """将中文查询切词并提取中文短语，避免空 token 干扰匹配。"""
-
-    parts = re.split(r"[\s,，。；;:：!！?？、/\\|()（）【】\-]+", query)
-    tokens = [item.strip().lower() for item in parts if item.strip()]
-    phrases = [seg for seg in re.findall(r"[\u4e00-\u9fff]{2,}", query)]
-    for phrase in phrases:
-        lower = phrase.lower()
-        if lower not in tokens:
-            tokens.append(lower)
-    return sorted(set(tokens))
+# 分词统一收敛到 text_utils.tokenize（以 _tokenize 别名保持模块内调用不变）。
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -601,10 +592,10 @@ class PersonalFileSearchService:
         candidates = self._rerank_within(candidates, normalized_reply if normalized_reply else session.query, top_k)
 
         state, question, should_disambiguate = self._decide_state(candidates, False)
-        session.turn += 1
-        session.query = session.query
-        session.candidates = candidates
-        self._sessions[session_id] = session
+        with self._session_lock:
+            session.turn += 1
+            session.candidates = candidates
+            self._sessions[session_id] = session
         _LOGGER.info(
             "personal-search-clarify-completed",
             extra={
@@ -828,14 +819,26 @@ class PersonalFileSearchService:
         return selected
 
     def _rerank_within(self, candidates: list[_SearchCandidate], query: str, top_k: int) -> list[_SearchCandidate]:
-        """基于用户回复再打一次分，推动候选向真实目标收敛。"""
+        """基于用户回复再打一次分，推动候选向真实目标收敛。
+
+        打分策略：
+        - 回复文本同时以字面线索和语义向量参与打分（此前 embedding 传 None，
+          导致 clarify 之后语义信号整体丢失）；
+        - 上一轮得分只作为低权重先验保留，避免回复线索较少时排序塌缩；
+        - 不再对旧第一名做 +1.0 硬性加分：那会突破 [0,1] 分值域，并让
+          _decide_state 的分差判定（>=0.35）几乎必然命中，追问一轮后总是
+          resolved 成旧第一名，用户补充的线索被架空。
+        """
 
         if not candidates:
             return []
         parsed_tokens = _tokenize(query)
         source_hints = self._extract_source_hints(query)
         visual_hints = self._extract_visual_hints(query)
+        version_hint = self._extract_version_hint(query)
+        query_embedding = self.embed_text(query)
 
+        prior_weight = 0.3
         ranked: list[_SearchCandidate] = []
         for candidate in candidates:
             base_score, evidence, matched = self._score_item(
@@ -844,11 +847,18 @@ class PersonalFileSearchService:
                 parsed_tokens,
                 source_hints,
                 visual_hints,
-                self._extract_version_hint(query),
-                None,
+                version_hint,
+                query_embedding,
             )
-            boosted = base_score + (1.0 if candidate.item.file_id == candidates[0].item.file_id else 0.0)
-            ranked.append(_SearchCandidate(item=candidate.item, score=boosted, evidence=f"{candidate.evidence}；{evidence}", matched_clues=sorted(set(candidate.matched_clues + matched))))
+            combined = _clamp01((1.0 - prior_weight) * base_score + prior_weight * candidate.score)
+            ranked.append(
+                _SearchCandidate(
+                    item=candidate.item,
+                    score=combined,
+                    evidence=f"{candidate.evidence}；{evidence}",
+                    matched_clues=sorted(set(candidate.matched_clues + matched)),
+                )
+            )
 
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked[:top_k]
@@ -916,20 +926,40 @@ class PersonalFileSearchService:
         return "我有两条很接近的结果，选一个更确定的描述：例如‘5月的那张’/‘群里的那张’。"
 
     def _filter_candidates_by_reply(self, candidates: list[_SearchCandidate], reply: str) -> list[_SearchCandidate]:
+        """按用户回复过滤候选。
+
+        除字面命中外，还识别两类最常见的自然回复线索：
+        - 时间线索（"上周的/昨天的"）：按 captured_at 匹配，字面文本里没有"上周"字样；
+        - 来源线索（"微信群里的"）：中文关键词映射到 source_app（wechat 等）再比对。
+        此前只做字面 token 匹配，这两类回复会把全部候选滤空，clarify 直接死路。
+        """
+
         reply_lower = reply.lower()
+        reply_tokens = _tokenize(reply_lower)
+        source_hints = self._extract_source_hints(reply)
         filtered = []
         for candidate in candidates:
+            item = candidate.item
             text = " ".join(
                 [
-                    candidate.item.title,
-                    candidate.item.summary,
-                    candidate.item.doc_type,
-                    candidate.item.source_app,
-                    " ".join(candidate.item.tags),
-                    " ".join(candidate.item.visual_hints),
+                    item.title,
+                    item.summary,
+                    item.doc_type,
+                    item.source_app,
+                    " ".join(item.tags),
+                    " ".join(item.visual_hints),
                 ]
             ).lower()
-            if reply_lower in text or any(token in text for token in _tokenize(reply_lower)):
+            if reply_lower in text or any(token in text for token in reply_tokens):
+                filtered.append(candidate)
+                continue
+            time_hit, _ = _has_time_match(item.captured_at, reply)
+            if time_hit:
+                filtered.append(candidate)
+                continue
+            # 与 _score_item 同口径：来源提示词出现在候选文本任意位置即算命中
+            # （如 "image" 提示可命中 doc_type="image"，不必局限 source_app）。
+            if source_hints and any(hint in text for hint in source_hints):
                 filtered.append(candidate)
         return filtered
 

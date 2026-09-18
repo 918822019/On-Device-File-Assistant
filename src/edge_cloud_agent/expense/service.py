@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from ..config import ExpenseConfig
 from ..embedding_runtime import EdgeEmbeddingRuntime
+from ..text_utils import tokenize
 from .schemas import (
     ExpenseCollectRequest,
     ExpenseExportRequest,
@@ -31,7 +32,17 @@ _DATE_PATTERNS = [
     re.compile(r"(\d{1,2})月(\d{1,2})日"),
 ]
 _MERCHANT_PATTERNS = [
-    re.compile(r"(?:商户|收款方|单位|医院|门店|机构)[:：]?\s*([^\n，,。；;:：]+)"),
+    # 惰性捕获商户名，遇到以下任一即截止：连续空白（字段间常用多空格分隔）、
+    # 标点、常见后续字段关键词、换行、串尾。
+    # 旧模式为贪婪匹配且只排除标点/冒号，"商户: 京东  金额: 128" 会抽出
+    # "京东  金额"，把下一个字段吞进商户名。
+    # 标签后必须跟冒号或空白：句中恰好包含"商户/单位"等词时（如"没有商户字段"）
+    # 不会误把后续文本当成商户名抽出。
+    re.compile(
+        r"(?:商户|收款方|单位|医院|门店|机构)[:：\s]\s*"
+        r"([^\n，,。；;:：]+?)"
+        r"(?=\s{2,}|\s*[，,。；;:：]|\s*(?:金额|日期|时间|单号|订单|发票号|合计)|[\r\n]|\s*$)"
+    ),
 ]
 
 
@@ -338,8 +349,11 @@ class ExpenseService:
                 material.raw_text.lower(),
             ]
         )
+        # 用共享分词器替代 keyword.split()：中文查询通常不带空格，
+        # 按空格切会退化成单个整 token（如"京东发票"），命中率显著偏低。
+        tokens = tokenize(keyword)
         keyword_score = 0.0
-        for token in keyword.split():
+        for token in tokens:
             if token and token in haystack:
                 keyword_score += 1.0
 
@@ -347,4 +361,4 @@ class ExpenseService:
         if query_embedding is not None and material.embedding:
             embed_score = self._cosine_similarity(query_embedding, material.embedding)
 
-        return round((keyword_score / max(1, len(keyword.split()))) * 0.7 + embed_score * 0.3, 4)
+        return round((keyword_score / max(1, len(tokens))) * 0.7 + embed_score * 0.3, 4)

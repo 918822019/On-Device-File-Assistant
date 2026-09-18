@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from fastapi import APIRouter, HTTPException, Request
 from time import perf_counter
 
@@ -27,6 +29,48 @@ from ..personal_search.service import PersonalFileSearchService
 
 router = APIRouter()
 _LOGGER = logging.getLogger("agent_server.personal_search.router")
+
+# 节流异步刷新的全局状态：防止并发请求同时触发多个后台扫描。
+_REFRESH_LOCK = threading.Lock()
+
+
+def _maybe_refresh_index(request: Request, service: PersonalFileSearchService, cfg: PersonalFileConfig, trace_id: str | None) -> None:
+    """带节流的异步增量刷新。
+
+    此前 /search 每次请求都同步 run_once（全量目录扫描 + 读文件 + embedding +
+    FAISS 重建），文件量上来后首查延迟不可接受，且与后台 watch 线程重复劳动。
+    现在改为：每 scan_interval_seconds 窗口内最多触发一次后台扫描，请求立即返回；
+    新鲜度由「启动 warm scan + 后台 watch loop + 本节流刷新」共同保证。
+    """
+
+    state = request.app.state
+    now = time.monotonic()
+    window = max(5, cfg.scan_interval_seconds)
+    with _REFRESH_LOCK:
+        last = getattr(state, "personal_refresh_ts", 0.0)
+        running = getattr(state, "personal_refresh_running", False)
+        if running or now - last < window:
+            return
+        state.personal_refresh_ts = now
+        state.personal_refresh_running = True
+
+    def _worker() -> None:
+        try:
+            run_once(service, cfg, trace_id=trace_id)
+        except Exception:
+            _LOGGER.warning(
+                "personal-search-api-refresh-failed",
+                extra={
+                    "event": "api.search.refresh_failed",
+                    "trace_id": trace_id,
+                    "path": "/v1/search-agent/search",
+                },
+            )
+        finally:
+            with _REFRESH_LOCK:
+                state.personal_refresh_running = False
+
+    threading.Thread(target=_worker, name="personal-file-refresh", daemon=True).start()
 
 
 def _get_service(request: Request) -> PersonalFileSearchService:
@@ -51,10 +95,19 @@ def _service_config(request: Request) -> PersonalFileConfig:
     return getattr(request.app.state, "personal_file_cfg", PersonalFileConfig())
 
 
-def _normalize_top_k(top_k: int, cfg: PersonalFileConfig) -> int:
-    """限制 top_k 落在允许区间，防止无意的极端查询。"""
+# 与 schemas.FileSearchRequest / FileSearchSessionRequest 的 le=20 约束保持一致。
+_TOP_K_HARD_LIMIT = 20
 
-    return max(1, min(top_k, cfg.top_k_default))
+
+def _normalize_top_k(top_k: int) -> int:
+    """按 schema 声明的允许区间钳制 top_k。
+
+    此前钳到 cfg.top_k_default（默认 8）：用户显式传 top_k=20 会被静默截到 8，
+    与 schema 的 le=20 相互矛盾。top_k_default 是"客户端未指定"时的缺省值，
+    不应充当上限。
+    """
+
+    return max(1, min(top_k, _TOP_K_HARD_LIMIT))
 
 
 def _action_suggestions(state: str, has_candidates: bool, resolved_file: bool) -> list[str]:
@@ -93,7 +146,7 @@ def search(req: FileSearchRequest, request: Request):
     service = _get_service(request)
     cfg: PersonalFileConfig = _service_config(request)
     request_trace_id = _trace_id(request)
-    top_k = _normalize_top_k(req.top_k, cfg)
+    top_k = _normalize_top_k(req.top_k)
     _LOGGER.info(
         "personal-search-api-search-requested",
         extra={
@@ -108,19 +161,8 @@ def search(req: FileSearchRequest, request: Request):
     started = perf_counter()
 
     if cfg.source_dir:
-        # 入口级别做一次轻量增量刷新，保证第一次查询尽量可见。
-        try:
-            run_once(service, cfg, trace_id=request_trace_id)
-        except Exception as exc:
-            _LOGGER.warning(
-                "personal-search-api-search-rebuild-failed",
-                extra={
-                    "event": "api.search.rebuild_failed",
-                    "trace_id": request_trace_id,
-                    "path": "/v1/search-agent/search",
-                },
-            )
-            pass
+        # 节流异步刷新：不再阻塞本次请求（同步全量扫描会让首查延迟随文件数爆炸）。
+        _maybe_refresh_index(request, service, cfg, request_trace_id)
     session_id, candidates, state, should_disambiguate, question = service.start_search(
         req.query,
         top_k=top_k,
@@ -161,7 +203,7 @@ def clarify(req: FileSearchSessionRequest, request: Request):
     service = _get_service(request)
     cfg: PersonalFileConfig = _service_config(request)
     request_trace_id = _trace_id(request)
-    top_k = _normalize_top_k(req.top_k, cfg)
+    top_k = _normalize_top_k(req.top_k)
     started = perf_counter()
 
     _LOGGER.info(
@@ -502,5 +544,6 @@ def rebuild_index(request: Request):
         imported=result.imported,
         skipped=result.skipped,
         errors=result.errors,
+        removed=result.removed,
         material_ids=result.material_ids,
     )

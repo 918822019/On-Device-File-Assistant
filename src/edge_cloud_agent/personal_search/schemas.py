@@ -104,4 +104,5 @@ class RebuildIndexResponse(BaseModel):
     imported: int = 0
     skipped: int = 0
     errors: int = 0
+    removed: int = 0
     material_ids: list[str] = Field(default_factory=list)

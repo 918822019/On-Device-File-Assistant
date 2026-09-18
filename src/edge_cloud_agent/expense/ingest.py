@@ -94,8 +94,9 @@ def run_once(service: ExpenseService, cfg: ExpenseConfig) -> IngestResult:
 
         raw_text = _read_text_file(file_path)
         if not raw_text:
+            # 白名单内的 pdf/图片本就读不出文本，属于预期跳过；
+            # 此前同时计入 skipped 和 errors，导致监控里全是假告警。
             skipped += 1
-            errors += 1
             continue
 
         claim_id = _normalize_claim_from_path(str(watch_root), file_path, cfg.default_claim_id)

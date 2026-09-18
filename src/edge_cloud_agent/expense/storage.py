@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -33,7 +34,27 @@ class ExpenseMaterial:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ExpenseMaterial":
-        return cls(**payload)
+        """容错构造：历史 JSONL 中多出/缺失字段时不整行崩溃（与 personal 侧对齐）。"""
+
+        return cls(
+            material_id=payload.get("material_id", ""),
+            claim_id=payload.get("claim_id", ""),
+            title=payload.get("title", ""),
+            doc_type=payload.get("doc_type", "receipt"),
+            source_app=payload.get("source_app", "manual"),
+            raw_text=payload.get("raw_text", ""),
+            summary=payload.get("summary", ""),
+            extracted_amount=payload.get("extracted_amount"),
+            extracted_date=payload.get("extracted_date"),
+            merchant=payload.get("merchant"),
+            captured_at=payload.get("captured_at"),
+            file_uri=payload.get("file_uri"),
+            notes=payload.get("notes"),
+            keywords=payload.get("keywords", []) or [],
+            created_at=payload.get("created_at", ""),
+            updated_at=payload.get("updated_at", ""),
+            embedding=payload.get("embedding"),
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -98,8 +119,12 @@ class ExpenseStore:
                     continue
 
     def _persist(self) -> None:
+        """原子落盘：先写临时文件再 os.replace，避免中途崩溃留下半截 JSONL。"""
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as file:
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as file:
             for material in self._items.values():
                 file.write(json.dumps(material.to_dict(), ensure_ascii=False))
                 file.write("\n")
+        os.replace(tmp_path, self.path)
