@@ -54,7 +54,12 @@ data class LocalScanResult(
 class LocalFileIndexStore(context: Context) {
 
     private val appContext = context.applicationContext
-    private val storeFile = File(context.filesDir, INDEX_FILE_NAME)
+    // 按 edge-runtime-data-layout.md 约定放 noBackupFilesDir/metadata/（不参与
+    // 系统备份、卸载即删）。旧版本落在 filesDir，init 时自动迁移一次。
+    // 目标形态是 metadata/files.db；当前先保持 JSON，格式升级另行排期。
+    private val storeDir = File(context.noBackupFilesDir, "metadata")
+    private val storeFile = File(storeDir, INDEX_FILE_NAME)
+    private val legacyStoreFile = File(context.filesDir, INDEX_FILE_NAME)
     private val gson = Gson()
 
     private val _itemsById = LinkedHashMap<String, LocalIndexedFile>()
@@ -92,6 +97,7 @@ class LocalFileIndexStore(context: Context) {
 
     private fun persistUnsafe(items: Map<String, LocalIndexedFile>) {
         runCatching {
+            storeDir.mkdirs()
             val text = gson.toJson(items.values.toList())
             storeFile.writeText(text)
             RuntimeEventLog.log(appContext, "file_index", "persist_ok", "count=${items.size} path=${storeFile.absolutePath}")
@@ -106,7 +112,8 @@ class LocalFileIndexStore(context: Context) {
         return when {
             normalized.contains("wechat") || normalized.contains("微信") || normalized.contains("weixin") -> "wechat"
             normalized.contains("mail") || normalized.contains("邮箱") || normalized.contains("gmail") -> "email"
-            normalized.contains("camera") || normalized.contains("photo") || normalized.contains("photo") -> "camera"
+            // dcim 是 Android 相机标准目录；原实现把 "photo" 写了两遍，是笔误
+            normalized.contains("camera") || normalized.contains("dcim") || normalized.contains("photo") -> "camera"
             normalized.contains("screenshot") || normalized.contains("截图") -> "screenshot"
             normalized.contains("download") || normalized.contains("downloads") -> "downloads"
             normalized.contains("documents") || normalized.contains("文档") || normalized.contains("docs") || normalized.contains("doc") -> "document"
@@ -224,6 +231,8 @@ class LocalFileIndexStore(context: Context) {
             }
 
             val collected = collectFromFilesUri(resolver)
+            // 命中 LIMIT 上限说明可能有文件被静默截断，日志显式标注
+            val truncated = collected.size >= MAX_INDEX_SIZE
             val upserted = ArrayList<LocalIndexedFile>()
 
             synchronized(_itemsById) {
@@ -254,18 +263,25 @@ class LocalFileIndexStore(context: Context) {
                 TAG,
                 "local-index-rebuild reason=$reason scanned=${result.scanned}" +
                     " upserted=${result.upserted} unchanged=${result.unchanged}" +
-                    " removed=${result.removed} cost_ms=${result.durationMs}",
+                    " removed=${result.removed} truncated=$truncated cost_ms=${result.durationMs}",
             )
             RuntimeEventLog.log(
                 appContext,
                 "file_index",
                 "rebuild",
-                "reason=$reason scanned=${result.scanned} upserted=${result.upserted} unchanged=${result.unchanged} removed=${result.removed} dur_ms=${result.durationMs}",
+                "reason=$reason scanned=${result.scanned} upserted=${result.upserted} unchanged=${result.unchanged} removed=${result.removed} truncated=$truncated dur_ms=${result.durationMs}",
             )
             result
         }
 
     init {
+        // 一次性迁移旧位置（filesDir）的索引文件；日志等非资产，失败直接丢弃。
+        runCatching {
+            storeDir.mkdirs()
+            if (legacyStoreFile.exists() && !storeFile.exists()) {
+                legacyStoreFile.renameTo(storeFile)
+            }
+        }.onFailure { Log.w(TAG, "index-store-migrate-failed", it) }
         // 预加载历史索引，保障服务启动后立刻有可读快照。
         val initial = runCatching { loadFromDiskUnsafe() }.getOrElse { linkedMapOf() }
         RuntimeEventLog.log(appContext, "file_index", "store_init", "count=${initial.size} path=${storeFile.absolutePath}")

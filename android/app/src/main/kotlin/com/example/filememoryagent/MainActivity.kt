@@ -27,7 +27,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.MaterialTheme
@@ -293,7 +293,17 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(context, "暂无日志文件", Toast.LENGTH_SHORT).show()
             return
         }
-        val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", logFile)
+        // 日志现落盘在 noBackupFilesDir（见 edge-runtime-data-layout.md 约定），
+        // 不在 FileProvider 的 file_paths.xml 覆盖范围内（只有 files/cache/external），
+        // 直接 getUriForFile 会抛 IllegalArgumentException。先复制到 cacheDir 再分享。
+        val shareCopy = File(context.cacheDir, logFile.name)
+        val copied = runCatching { logFile.copyTo(shareCopy, overwrite = true) }.isSuccess
+        if (!copied) {
+            RuntimeEventLog.log(context, "ui", "logs_share_copy_failed", logFile.absolutePath)
+            Toast.makeText(context, "日志复制失败，请改用复制按钮", Toast.LENGTH_LONG).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", shareCopy)
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_SUBJECT, "文件记忆助手运行日志")
@@ -440,7 +450,7 @@ private fun ScreenContent(
                 }
             }
 
-            Divider(modifier = Modifier.height(8.dp))
+            HorizontalDivider(modifier = Modifier.height(8.dp))
             Text(text = "候选结果（${rsp.candidates.size}）", fontWeight = FontWeight.Bold)
 
             LazyColumn(

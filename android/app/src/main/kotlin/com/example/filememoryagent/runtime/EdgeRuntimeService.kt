@@ -60,10 +60,14 @@ class EdgeRuntimeService : LifecycleService() {
     private val observers = mutableListOf<ContentObserver>()
     private var lastScanSummary: LocalScanResult? = null
 
+    // onCreate 完成（目录就绪 + 观察者注册尝试完毕）后置位；此前 isReady() 恒 true，是桩。
+    @Volatile
+    private var runtimeReady = false
+
     inner class LocalBinder : Binder() {
         fun service(): EdgeRuntimeService = this@EdgeRuntimeService
 
-        fun isReady(): Boolean = true
+        fun isReady(): Boolean = runtimeReady
 
         fun localIndexSize(): Int = indexStore.size()
 
@@ -87,6 +91,7 @@ class EdgeRuntimeService : LifecycleService() {
         registerWatchObservers()
         startPeriodicScan()
         scheduleScan("service_start")
+        runtimeReady = true
         Log.i(TAG, "edge-runtime-created")
         RuntimeEventLog.log(this, "edge_runtime", "service_initialized", "watchers_registered=${observers.size}")
     }

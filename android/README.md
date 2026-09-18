@@ -32,7 +32,7 @@
 已补充的端侧能力（不依赖模型）：
 - 服务启动自动建索引 + 周期扫描（5 分钟）。
 - 文件变更监听（MediaStore）触发去抖动增量扫描。
-- 索引持久化到 `app/filesDir/local_file_index.json`。
+- 索引持久化到 `app/noBackupFilesDir/metadata/local_file_index.json`（不备份、卸载即删；旧 `filesDir` 位置自动迁移）。
 - 文件打开动作支持 content/http/file 路径，无法直接打开时自动复制 URI 到剪贴板。
 - 运行时存储权限申请与不足引导。
 
@@ -52,7 +52,7 @@
   - 记录服务创建、扫描触发、扫描结果、权限告警和异常。
   - 可快速确认 `MediaStore` 是否在持续触发重建。
 - 持久化日志文件：
-  - 文件名：`runtime_events.log`，位于 `app/filesDir`。
+  - 文件名：`runtime_events.log`，位于 `app/noBackupFilesDir/logs/`（超 256KB 自动轮转，保留最近 300 行；旧 `filesDir` 位置自动迁移；分享时经 `cacheDir` 中转以适配 FileProvider）。
   - 发生在应用内部存储，适合抓日志排障。
 
 日志事件示例：
