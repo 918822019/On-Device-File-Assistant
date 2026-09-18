@@ -196,15 +196,50 @@ Qwen2.5-0.5B 的约 5 倍。能力差距是否值这个体积，需要按实际�
 
 ---
 
-## 8. 待验证清单（引擎选型时逐项确认）
+## 8. 自研引擎（tiny-llm）已验证项
 
-- [ ] **PLE 能否 mmap / 流式加载而不整体驻留**（决定 1.5 GB vs 2.9 GB）
-- [ ] 是否支持 `gemma4` / `Gemma4ForConditionalGeneration` 架构
-- [ ] 是否支持 `layer_types` 混合注意力（28 sliding window=512 + 7 full，`global_head_dim` 与 `head_dim` 不同）
-- [ ] 是否支持 `num_kv_shared_layers` 的 KV 共享
-- [ ] 是否支持 `tie_word_embeddings`
-- [ ] 是否支持 262144 词表的 tokenizer（`tokenizer.json` 32 MB）
-- [ ] int4 反量化在目标 ARM CPU 上是否有 SIMD/点积加速
-- [ ] 能否只加载 `language_model` 而跳过 vision/audio 塔
-- [ ] 是否有 NPU/GPU 后端，以及 gemma4 算子的覆盖程度
-- [ ] 目标机型上的实际常驻内存与 LMK 存活情况
+这张清单原本是给「选第三方引擎」用的。现在走的是自研路线
+（`third_party/tiny-llm`，分支 `feat/gemma4-ple`），逐项状态如下。
+**判据写在每一项后面** —— 「已验证」必须说明是在什么条件下验证的，
+否则和没验证一样（本文档 §6 的教训：估算值必须与实测值分开标注）。
+
+| 项 | 状态 | 判据 / 缺口 |
+|---|---|---|
+| `gemma4` 架构支持 | ✅ | `ModelType::kGemma4`；假模型导出→加载→前向→greedy decode 全通 |
+| `layer_types` 混合注意力 | ✅ | 逐层 `head_dim_of(i)`；两套 RoPE（sliding=default/1e4、full=**proportional**/1e6+0.25）。C++ ↔ HF 逐位置对齐，29 位置最差 rel 1.8e-5、argmax 逐步一致 |
+| sliding window | ✅ | 窗口起点处误差**无跳变**（pos 7=9.8e-7 → 8=3.1e-6 → 9=2.3e-6）。⚠️ 只在 window=8 的假模型上验过；真模型 window=512 未测 |
+| `num_kv_shared_layers` KV 共享 | ✅ | 零拷贝（共享层与提供方同一物理槽位）；提供方 = 每种 layer_type 在边界前的最后一层。**同上，只在 6 层假模型上验过** |
+| `tie_word_embeddings` | ✅ | `lm_head_ = embed_`；并修掉了假模型生成器给 tied 两键填独立随机数导致「参考实现自己是坏的」的坑（见设计文档 §7.1） |
+| **PLE 流式加载不整体驻留** | ✅ 机制 | `--ple-ssd`：整表留盘、每 token pread 一行。常驻 vs 留盘 **logits 逐字节 IDENTICAL**，且留盘路径也与 HF 对齐。⚠️ **省内存的绝对量只在 0.19 MB 的假表上验过**；真表 4.7 GB 的收益是推算值 |
+| 只加载 `language_model`，跳过 vision/audio | ✅ | 导出器 `SKIP_PREFIXES` 在**读取阶段**就跳过，多模态塔连内存都不进 |
+| int4 反量化的 ARM SIMD 加速 | ⬜ 未做 | gemma4 的 i4 导出还没写（任务 #23）。Qwen 侧已有 `matvec_i4_sdot*` NEON 变体可复用，`kMaxInDim=16384` > 加倍宽 intermediate 12288 ✅ |
+| Android arm64 交叉编译 | ✅ | `scripts/build_android.sh` 产出 ARM aarch64 ELF（interpreter `/system/bin/linker64`），NEON 变体与新 kernel 均已编入 |
+| **目标机型实测** | ❌ 阻塞 | `adb devices` 为空，且无 AVD / 系统镜像，emulator 起不来。需要接一台真机（任务 #24） |
+| 262144 词表 tokenizer | ❌ 未接 | C++ 侧只吃 token id 序列，detokenize 仍在 Python（这是一个有意的既定决策，不是缺口） |
+| NPU/GPU 后端 | ❌ 未做 | 当前 gemma4 只有 CPU 路径。Vulkan 后端存在但未接 gemma4 算子 |
+
+### 8.1 真模型尚未导出（当前最大缺口）
+
+上面所有 ✅ 都是在**缩小版假模型**上得到的：6 层 / hidden 64 /
+head_dim 32+64 / vocab 512 / ple_dim 16。真模型是 35 层 / hidden 1536 /
+head_dim 256+512 / vocab 262144 / ple_dim 256。
+
+导出器目前把全部张量以 fp32 驻留，真模型峰值约 **20.5 GB**（仅 PLE 表
+就 9.4 GB），而本机空闲约 18.7 GB —— 强行跑会换页，且波及同机其他服务，
+故**没有**导出。需要先把 `write_tqwen` 改成两遍流式（第一遍只读
+safetensors 元数据算 offset，第二遍逐张量载入→转换→写出→释放），
+峰值可降到单个张量。这是任务 #21，也是 #22（真模型导出 + 常驻内存实测）
+和 #23（i4）的共同前置项。
+
+**已经用真 config 算过（不是跑过）的部分**：kernel 的硬编码上限全部通过
+（导出期新增校验，见 `validate_runtime_limits`）——
+
+| 常量 | 上限 | 真模型实际值 |
+|---|---|---|
+| `kMaxHalf`（rope_ref / rope_neon） | 256 | sliding head_dim 256 → half **128** ✅ |
+| `kMaxAngles`（proportional_rope_ref） | 512 | 0.25×512//2 = **64** ✅ |
+| `kMaxTensorName` | 64 | 最长 **48**（`model.layers.34.post_per_layer_input_norm.weight`）✅ |
+| `kMaxInDim`（matvec_i4_sdot*） | 16384 | 加倍宽 intermediate **12288** ✅ |
+
+即：真模型的**形状**不会撞上任何硬编码上限；未验证的是真形状下的
+**数值**与**内存/速度**。

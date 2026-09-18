@@ -372,8 +372,12 @@ Vulkan/CUDA 留 stub。
 | **2+3+4** | 张量绑定 + 逐层 head_dim + KvCache 异构槽位 + KV 共享映射 | 假模型导出→加载→绑定全通过 | 已交付（`376dc84`）。**三个阶段合并做了**，理由见下 |
 | **2b** | gemma4 forward（decode + prefill）：PLE 三残差块、sliding 掩码、GEGLU、scaling=1.0、softcapping、layer_scalar | 假模型 logits 与 HF 对齐 | 已交付（`83f8ddf`）。逐 token prefill（与 decode 共用实现）；批量 GEMM prefill 未做 |
 | **0b** | `align_fake_gemma4_model.py` 数值对齐 | C++ ↔ HF 逐位置 logits + 逐阶段中间量 | 已交付（`83f8ddf`）。12/24 token 两组均通过，argmax 逐步一致 |
-| **5** | **PLE 流式**：`ExpertStore::read_bytes` 整行读 + 单行缓冲 | 常驻 RAM 从 ~2.6 GB 降到 ~1.3 GB | 未做（绑定已支持 `data==nullptr` + offset） |
-| **6** | i4 量化导出 + Android 交叉编译 + 目标机型实测 | 端侧可用 | 未做 |
+| **5** | **PLE 流式**：`ExpertStore::read_bytes` 整行读 + 单行缓冲 | 常驻 RAM 从 ~2.6 GB 降到 ~1.3 GB | 机制已交付（`78eb51a`，`--ple-ssd`）。常驻 vs 留盘 logits 逐字节一致、且留盘路径也与 HF 对齐。⚠️ 省内存的**绝对量**只在 0.19 MB 假表上验过 |
+| **6a** | Android arm64 交叉编译 | 可在设备上执行的二进制 | 已交付：ARM aarch64 ELF，NEON 变体与新 kernel 均已编入 |
+| **6b** | exporter 流式改造（两遍写） | 真模型可导出 | **未做，且是当前最大阻塞**。现峰值 ~20.5 GB > 本机空闲 18.7 GB。是 6c/6d 的共同前置项 |
+| **6c** | 真模型导出 + 常驻内存/速度实测 | 回填 `edge-model-budget.md` 的推算值 | 未做（依赖 6b）。真 config 的 kernel 硬编码上限已全部**算过**并通过 |
+| **6d** | i4 量化导出 | 端侧可用的 ~2.5 GB 体积 | 未做（依赖 6b） |
+| **6e** | 目标机型实测 | 端侧可用 | ❌ 阻塞：`adb devices` 为空，且无 AVD/系统镜像 |
 
 **为什么把 2/3/4 合并**：原分期假设「先全 full-attention、不共享 KV」能独立交付。
 实际做下来这个中间态没有价值 —— 绑定期的形状校验必须知道逐层 head_dim 和
