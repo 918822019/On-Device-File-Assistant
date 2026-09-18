@@ -266,7 +266,7 @@ tied 的 embed 被卸载 → **lm_head 指针悬空**。这正是注释警告的
 
 ## 5. 风险清单（按严重度排序）
 
-### R1 — KvCache 改造的连带面（最高）
+### R1 — KvCache 改造的连带面（**已解决**，tiny-llm `376dc84`）
 
 需要同时支持：① 逐层不同 head_dim（256/512）；② `num_kv_shared_layers=20` 的
 layer→物理槽映射。
@@ -275,9 +275,30 @@ layer→物理槽映射。
 **投机解码的 checkpoint/restore/truncate**（`qwen_model.h:261-278`）、多个测试。
 属于「改一处、验十处」。
 
-缓解：先把 sliding/full 两套 arena 分开（28 层 × head_dim 256 + 7 层 × head_dim 512），
-避免引入通用的逐层 head_dim 数组；KV 共享用一个 `logical→physical` 间接表，
-默认恒等映射，只有 gemma4 才启用。**必须为投机解码路径单独加回归测试。**
+**实际采用的方案与上面的缓解设想不同**，两处修正：
+
+1. **没有分两套 arena，而是逐槽位 stride。** 「sliding arena + full arena」
+   仍是同构思路的延伸，且要把「层→哪套 arena」和「层→arena 内下标」两级映射
+   都写对。改成通用的 `KvLayerSpec[]`（每槽位自带 head_dim/n_kv_heads）后，
+   同构只是「n 个相同 spec」的退化情形，`init()` 直接委托 `init_hetero()`，
+   两条路径共用一份分配逻辑 —— 不存在两套代码各自漂移的问题。
+2. **共享不是拷贝，是同一个槽位。** `slot_map_`（逻辑层→物理槽）让尾部 20 层
+   直接指向提供方（真模型 layer 13/14）的槽位，读到的是同一块内存。
+   缺省恒等映射，Qwen 族零改动。
+
+等价性不靠读代码断言：`kv_cache_homogeneous_equals_uniform_hetero` 用同一批
+写入比对两条路径的整块内存；另外在 `c42787d` 建 baseline 二进制，对
+qwen2 / qwen3 / qwen35 混合架构 / qwen35-MoE 各跑 `--dump-logits`
+逐字节比对，**全部 IDENTICAL**（含 fp16 KV）。qwen35 那条尤其关键 ——
+它是唯一使用紧凑 KV 下标（`full_layer_cache_index`）的路径。
+
+**遗留：sliding window 未做窗口裁剪存储。** 每个槽位仍分配全长 `max_seq_len`，
+窗口在 #18 的 attention 里以掩码体现。两个必要性：
+① 提供方 layer 13 自身是 sliding 层，但它给共享层的副本**必须全长**
+（`modeling_gemma4.py:1183` 注释明说），开窗口长度就供不上；
+② 全局 `seq_len_` 是单值，槽位容量小于它会让 `write_token` 越界。
+按窗口裁剪需先解决「位置→槽内偏移」的取模映射，是独立的内存优化
+（真模型 8K 上下文下 sliding 层可省 ~220 MB fp16），不在本次范围。
 
 ### R2 — PLE 行字节数算错会静默降级，不崩溃
 
@@ -344,15 +365,22 @@ Vulkan/CUDA 留 stub。
 
 ## 6. 建议分期
 
-| 阶段 | 内容 | 产出 | 依赖 |
+| 阶段 | 内容 | 产出 | 状态 |
 |---|---|---|---|
-| **0** | 读 transformers `Gemma4TextModel` 参考实现，钉死 `layer_scalar` 与 PLE 组合公式；写 `make_fake_gemma4_model.py` + `align_fake_gemma4_model.py` | 随机小模型上 C++ 与 HF logits 逐位置对齐（TOL=1e-5） | 无 |
-| **1** | V4Ext 头 + `ModelConfig` 字段 + `kGemma4` 枚举 + exporter `export_gemma4_to_tiny.py` | 能把真权重导出成 `.tqwen` 并通过 192B 头校验 | 阶段 0 |
-| **2** | 张量绑定分支 + gemma4 forward（**先全 full-attention、不共享 KV、PLE 常驻**） | 真模型 greedy decode 出正确文本 | 阶段 1 |
-| **3** | sliding window attention 变体 + 逐层 head_dim + KvCache 两套 arena | 混合注意力正确，投机解码回归通过 | 阶段 2 |
-| **4** | KV 共享（`num_kv_shared_layers=20`）+ logical→physical 间接表 | 内存下降，数值不变 | 阶段 3 |
-| **5** | **PLE 流式**：`is_offloadable` 泛化 + tied 守卫 fail-fast + `read_bytes` 整行读 | 常驻 RAM 从 ~2.6 GB 降到 ~1.3 GB | 阶段 2（可与 3/4 并行） |
-| **6** | i4 量化导出 + Android 交叉编译 + 目标机型实测 | 端侧可用 | 阶段 5 |
+| **0** | 读 transformers `Gemma4TextModel` 参考实现，钉死 `layer_scalar` 与 PLE 组合公式；写 `make_fake_gemma4_model.py` + `align_fake_gemma4_model.py` | 随机小模型上 C++ 与 HF logits 逐位置对齐（TOL=1e-5） | 参考规范 + 假模型已交付（`2b3bb26`）；**对齐脚本未做** |
+| **1** | V4Ext 头 + `ModelConfig` 字段 + `kGemma4` 枚举 + exporter `export_gemma4_to_tiny.py` | 能把真权重导出成 `.tqwen` 并通过 192B 头校验 | 已交付（`4b05317` `f5ea8e8` `c42787d`） |
+| **2+3+4** | 张量绑定 + 逐层 head_dim + KvCache 异构槽位 + KV 共享映射 | 假模型导出→加载→绑定全通过 | 已交付（`376dc84`）。**三个阶段合并做了**，理由见下 |
+| **2b** | gemma4 forward（decode + prefill）：PLE 三残差块、sliding 掩码、GEGLU、scaling=1.0、softcapping、layer_scalar | 假模型 logits 与 HF 对齐 | **未做**（当前由 fail-fast 守卫挡住） |
+| **5** | **PLE 流式**：`ExpertStore::read_bytes` 整行读 + 单行缓冲 | 常驻 RAM 从 ~2.6 GB 降到 ~1.3 GB | 未做（绑定已支持 `data==nullptr` + offset） |
+| **6** | i4 量化导出 + Android 交叉编译 + 目标机型实测 | 端侧可用 | 未做 |
+
+**为什么把 2/3/4 合并**：原分期假设「先全 full-attention、不共享 KV」能独立交付。
+实际做下来这个中间态没有价值 —— 绑定期的形状校验必须知道逐层 head_dim 和
+哪些层没有 k/v 权重，否则要么校验放宽（失去 fail-fast）、要么先写一版
+只支持同构的绑定再推翻。而 KvCache 的异构与共享映射共用同一份判据
+（`head_dim_of` / `kv_provider_layer`），拆成两步会让「绑定按 A 校验、
+存储按 B 分配」的错位有机会存在。合并后一次对齐，代价是这一步的验证面变大
+（故用 baseline 二进制做逐字节回归，而不是只跑单测）。
 
 **为什么阶段 0 必须最先做**：`layer_scalar` 和 PLE 公式猜错的后果是
 「能跑、不崩溃、输出垃圾」，与 R2 同类。先在随机小模型上对齐，
