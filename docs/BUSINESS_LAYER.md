@@ -180,3 +180,49 @@ reply ─► _filter_candidates_by_reply 三路保留:
    巧合兜住，缺显式映射表。
 6. 小项：`extraction_confidence` 恒 1.0（假指标）、export 的 `export_time`
    语义不准（取的是材料更新时间）、`datetime.utcnow()` 弃用告警。
+
+---
+
+## 五、检索演进方向：LLM wiki（已决策）
+
+> 2026-09-18 于 tiny-llm 会话确定，本节为正式记录。
+
+**方案**：由**端侧 LLM（tiny-llm gemma4 运行时）**在索引期为文件生成并增量
+维护 wiki 化知识页；查询时以 wiki 为主要检索面。与现有 embedding+FAISS
+语义检索**并存**——wiki 为主、向量兜底补召回，不是替代关系。**粒度尚未定**。
+
+### 动机（对应当前实现的三个实际弱点）
+
+1. 无中文分词下，长查询在字面匹配路得 0 分（见 §四.1），检索质量靠时间/来源
+   线索硬撑；wiki 页是 LLM 加工后的高浓缩自然语言，字面命中率天然更高。
+2. embedding 是检索端侧化路上唯一的模型依赖，而 EmbeddingGemma C++ 尚未开工；
+   wiki 生成复用 tiny-llm 已对齐的 gemma4 能力，端侧模型依赖可收敛为一个。
+3. `raw_text` 质量低（文件名/前 120 字符），LLM 生成的 wiki 页信息密度远高于
+   原始文本，同样支撑 tags/visual_hints 等结构化线索的自动填充。
+
+### 形态草图
+
+```
+索引期: 文件入库 ─► 端侧 tiny-llm 生成/增量维护 wiki 页
+                    （这是什么 / 谁相关 / 什么事件 / 何时；聚合页粒度待定）
+查询期: query ─► 命中 wiki 页（字面 + 结构导航）─► 多跳到目标文件
+              └► embedding 召回作为兜底补候选，进入同一套打分/消歧流程
+```
+
+现有的 `summary / tags / visual_hints / matched_clues` 字段即 wiki 化的雏形，
+差别只在生成方（正则/词表 → 端侧 LLM）。
+
+### 未决事项
+
+- [ ] **粒度**：每文件一页 vs 事件/人物/项目聚合页 vs 两级混合（用户明确表示未想好）
+- [ ] 增量维护：文件变更时重生成整页，还是 LLM 修补既有页
+- [ ] wiki 字面路与现有三路加权（0.65/0.30/0.25）的融合方式
+- [ ] 生成成本：端侧 CPU 逐文件跑 E2B 级模型的 token 成本与延迟预算
+- [ ] wiki 页存储位置：`files.db` 新表 vs 独立 markdown/JSONL（对应
+      [edge-runtime-data-layout.md](edge-runtime-data-layout.md) 的数据布局约定）
+
+### 依赖
+
+wiki 层开工依赖 tiny-llm 分期 **6c–6e**（真模型导出、i4 量化、真机实测）落地，
+见 [tiny-llm-gemma4-ple-design.md](tiny-llm-gemma4-ple-design.md) §6 分期表。
+在此之前，现有 embedding+规则检索继续作为工作实现演进。
