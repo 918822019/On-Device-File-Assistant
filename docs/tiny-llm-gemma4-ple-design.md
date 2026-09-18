@@ -429,7 +429,30 @@ embed，两边从第一个 token 就分叉。
 加载后 `embed_tokens.weight` 必须与 state_dict 逐元素相等、且与
 `lm_head.weight` 是同一份。
 
-### 7.3 阶段 6d（i4 量化）的落地设计 —— 已勘察，未实现
+### 7.4 阶段 6d（i4）的实施结果
+
+**已交付**（tiny-llm `b7b8640` `227f3e2` `9e5c72b`）：按 §7.3 的方案 A 实现，
+真模型导出跑通，常驻 1776 MB / 文件 2.96 GiB / 峰值 RSS 2.02 GiB。
+数字与抽检见 `edge-model-budget.md` §5.2。
+
+与 §7.3 预估的两处偏差，都是**预估错了**而不是实现走样：
+
+1. §7.3 说「PLE 的 i4 行反量化是全新代码」——**错**。`dequant_i4_row` 的
+   `dim` 是参数、不写死 hidden，PLE（dim = ple_packed = 8960）直接可用。
+   实际新增的只是「四种存储位置 × dtype 组合的显式分派」（原来只有一个
+   else 兜底当 fp32 读，i4 会掉进去静默乱码）。
+2. §7.3 没预料到 **`should_quantize` 的子串匹配会把 PLE 表判成「不量化」**：
+   它靠子串 `"embed_tokens"` 排除 embed，而 PLE 表名
+   `model.embed_tokens_per_layer.weight` 同样包含该子串。故分类规则必须由
+   知道架构的调用方给出（新增 `classify` 回调），不能塞进 `should_quantize`。
+
+**仍未完成的两项**（见 `edge-model-budget.md` §5.3）：
+matvec 阶梯的混合 dtype 选择（导致 i4 decode 速度测不准）、
+以及用户指定的 PPL 退化 + greedy token 一致率两项质量门槛。
+格式一致性已有决定性验证（`verify_i4_roundtrip.py`，5.96e-08），
+但**量化质量本身还没量化过**。
+
+### 7.3 阶段 6d（i4 量化）的落地设计 —— 已按方案 A 实现
 
 真模型 f16 常驻 4348 MB，手机端放不下，i4 是必须的（目标 ~1.8 GB）。
 本节记录已经**查证过的事实**，避免下次重新摸索。
