@@ -369,6 +369,53 @@ GPTQ 的手段是把已量化列的误差**摊到同行尚未量化的列**（�
 ⇒ **HQQ 不是可选路径，#28（GPTQ/AWQ 类误差补偿）是 i4 可用的必要条件。**
 记下这个上界，免得后续再去试 HQQ。
 
+### 5.5.2 PTQ 4-bit 的经验天花板 = 64.42%（实测，非推测）
+
+线索来自 ModelScope 上 `cyankiwi/gemma-4-E2B-it-AWQ-INT4` 的 ignore 列表
+（该仓库名字叫 AWQ，实际 `quant_method` 是 **compressed-tensors**，
+gs=32 / 非对称 / observer=mse）：320 条 ignore 里与文本塔相关的恰好是
+**全部 35 层的 `per_layer_input_gate` 与 `per_layer_projection`**（70 个 Linear）。
+而 #27 的消融只测过 PLE **表**保 f16，没测过这 70 个投影层 —— 是唯一未排除的
+敏感度来源。它们每个仅 256×1536，70 个合计 27M = 全模型的 **0.6%**。
+
+实测（534 token teacher-forcing，参考 HF bf16，f16 基线 97.57%）：
+
+| 变体 | argmax 一致率 | 文件 |
+|---|---|---|
+| i4 全量化 gs=64 | 60.11% | 2.96 GiB |
+| + PLE 投影层保 f16 | **63.48%** | 3.00 GiB（**+1.4%**） |
+| + 再叠 gs=32 + PLE 表 f16 + W4A32 kernel | **64.42%** | **6.25 GiB** |
+| f16（基线） | 97.57% | 8.6 GiB |
+
+两条结论：
+
+1. **PLE 投影层是单位参数最敏感的**：+3.37 点只花 +1.4% 体积，
+   比 group_size 减半（+1.87 点 / +8.5%）和 PLE 表保 f16（+0.56 点 /
+   磁盘 +3.2 GiB）都划算。社区的 ignore 列表是有信息量的。
+2. **增益不可加**：四个旋钮单独增益之和约 +7.7 点（预估 67.8%），
+   实测只有 +4.3 点（64.42%）⇒ 它们修的是同一份底层误差的不同侧面。
+   所以「再找几个敏感层排除掉」收益递减，**不存在靠堆排除项逼近 95% 的可能**。
+   而 64.42% 要付 6.25 GiB（已接近 f16 的 8.6 GiB），性价比崩塌。
+
+⇒ **PTQ 4-bit 对 gemma4 不可能达标，64.42% 是实测上限。**
+与 §5.5.1 的理论上界互相印证：`(scale,zero)` 搜索空间的全局最优是 8.504%
+相对 L2，而 min-max RTN 已达 9.568%（该空间的 89%），所以任何只在
+scale/zero/分组粒度/排除项上做文章的 PTQ 变体都撞同一堵墙。
+必须换算法档次：**QAT** 或 **GPTQ/AWQ 类输出误差补偿**。
+
+### 5.5.3 ModelScope 上现成产物的可用性排查
+
+| 仓库 | 下载 | 判定 |
+|---|---|---|
+| **`google/gemma-4-E2B-it-qat-q4_0-gguf`** | 1021 | **最有希望**。Google 官方 QAT（训练时把量化放进回路，模型本身适应量化，不是事后逼近），3194 MiB。但是 GGUF，需写读取器（q4_0 布局简单：每 32 元素一个 scale、对称） |
+| `unsloth/gemma-4-E2B-it-qat-mobile-GGUF` | 224 | 同上，且是**专为移动端**的 QAT 变体，与本项目目标最贴合 |
+| `cyankiwi/gemma-4-E2B-it-AWQ-INT4` | 59 | 不建议。名字是 AWQ 实为 `compressed-tensors`，runtime 无对应 dtype 需转格式；`observer=mse` 的天花板就是 §5.5.1 算出的 8.504%，大概率同样不达标；README 0 字节、作者未公布任何质量数字 |
+| `AXERA-TECH/gemma-4-E2B-it-GPTQ-INT4` | 20 | **名字骗人**：不是标准 GPTQ checkpoint，是爱芯元智 NPU 私有 `.axmodel`（还带 audio/vision 的 axmodel）。用不了。但其布局独立印证了我们的设计：PLE 表以 `.npy` f16 单独存（4480 MiB 未量化）、embed 以 bf16 单独存（768 MiB 未量化），只把文本层压成 419 MiB |
+
+⇒ **下一步应评估官方 QAT GGUF**，而不是自己实现 GPTQ/AWQ：
+QAT 的质量上限高于任何 PTQ，且是官方产物、无需校准语料与 Hessian。
+代价是要写 GGUF 读取器（q4_0 只需处理「每 32 元素一个 fp16 scale + 对称 int4」）。
+
 **根因**：真权重的重建相对 L2 误差 gs=64 是 9.11~9.86%、gs=32 是 7.90~8.39%、
 gs=128 是 10.63~10.91%（layers.0/17/34 的 gate_proj、q_proj、
 per_layer_input_gate 全都一样）。朴素 min-max RTN 的理论值：高斯分布
