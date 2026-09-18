@@ -441,8 +441,27 @@ embed，两边从第一个 token 就分叉。
   （`tools/export_qwen_to_tiny_i4.py:68-128`，917 行里有现成的量化器
   `pack_i4_groups`，可直接复用）。
 - loader 对 kI4 文件的 dtype 约束是「**只允许 kI4 或 kF32**」
-  （`model_loader.cpp:439-447`）——注意**不含 f16**，所以 gemma4 的 i4 导出
-  不能沿用 f16 那套逐张量 dtype 分配，小向量必须落 f32。
+  （`model_loader.cpp:441-447`）——注意**不含 f16**，所以 gemma4 的 i4 导出
+  不能直接沿用 f16 那套逐张量 dtype 分配，小向量必须落 f32。
+
+  **但紧邻的 kGPTQ4 分支（`:457-466`）恰好允许 gptq4/f32/f16 混合**，
+  且注释写明了理由：「embed/lm_head 保留源 dtype（真 checkpoint 里它们是
+  fp16，升 fp32 只是白白翻倍）」。这正是 gemma4 需要的形态。
+  于是有两条路：
+
+  | 方案 | 改动 | 常驻估算 |
+  |---|---|---|
+  | **A：kI4 分支放宽到允许 f16**（照抄 kGPTQ4 的理由） | loader 2 行 + 1 个测试；exporter 逐张量分派 dtype | embed 805 MB(f16) + matmul ~1.0 GB(i4) ≈ **1.8 GB** |
+  | B：embed 与 PLE 也量化成 i4 | 需给 gemma4 前向补两条 **i4 行反量化**（embed 可参照 Qwen 的 `dequant_i4_row`，PLE 是全新代码，in_dim=8960 而非 hidden） | embed ~214 MB + matmul ~1.0 GB ≈ **1.2 GB** |
+
+  **A 明显更划算**：多省 0.6 GB 常驻，代价是两条新的行反量化路径 +
+  一个新的验收难题（查表量化误差无法用 matvec 的容差口径衡量）。
+  而且 A 让 PLE 表可以**完全不动**（继续 f16 留盘，§5.1 已实测留盘不掉速），
+  磁盘 8.6 GB 虽然偏大但端侧是一次性下载。
+  选 A 的话，§7.3 表格里的第 2 项（i4 行反量化）整条可以划掉。
+
+  注意 `loader_rejects_mixed_dtype` 测的是 **v1/f32** 分支
+  （header 声明 f32、tensor 标 f16 必须拒绝），放宽 kI4 分支不影响它。
 - V4Ext 里的 `ple_row_bytes` 是**导出期算好写盘**的，运行期不重算。
   这个当初的决定在 i4 下正好是必需的：PLE 行字节数在 f16 是
   8960×2 = 17920，在 i4/gs=64 是 140×(4+32) = **5040**（4.5 bpw），
