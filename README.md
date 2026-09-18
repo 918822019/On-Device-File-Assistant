@@ -28,13 +28,21 @@
 - [src/edge_cloud_agent/cloud_client.py](src/edge_cloud_agent/cloud_client.py)：云端 API 客户端
 - [src/edge_cloud_agent/routing.py](src/edge_cloud_agent/routing.py)：路由策略层
 - [src/edge_cloud_agent/agent.py](src/edge_cloud_agent/agent.py)：路由与回退策略（Edge/Cloud 编排）
-- [src/edge_cloud_agent/main.py](src/edge_cloud_agent/main.py)：FastAPI 入口，提供 `/health`、`/v1/chat`、`/v1/embeddings`
+- [src/edge_cloud_agent/main.py](src/edge_cloud_agent/main.py)：FastAPI 入口，提供 `/health`、`/v1/chat`、`/v1/embeddings`、`/v1/expense/*`、`/v1/search-agent/*`
 - [src/edge_cloud_agent/routers/chat.py](src/edge_cloud_agent/routers/chat.py)：聊天路由定义
 - [src/edge_cloud_agent/routers/embeddings.py](src/edge_cloud_agent/routers/embeddings.py)：embedding 路由定义
 - [src/edge_cloud_agent/routers/expense.py](src/edge_cloud_agent/routers/expense.py)：报销场景闭环路由（收进来/找回来/拿出去）
 - [src/edge_cloud_agent/expense/storage.py](src/edge_cloud_agent/expense/storage.py)：报销材料本地持久化（本地 JSONL 存储）
 - [src/edge_cloud_agent/expense/service.py](src/edge_cloud_agent/expense/service.py)：报销工作流服务（字段抽取、检索、导出）
 - [src/edge_cloud_agent/expense/schemas.py](src/edge_cloud_agent/expense/schemas.py)：报销场景请求与响应模型
+- [src/edge_cloud_agent/routers/personal_search.py](src/edge_cloud_agent/routers/personal_search.py)：个人文件搜索路由（search/clarify/execute/rebuild-index）
+- [src/edge_cloud_agent/personal_search/service.py](src/edge_cloud_agent/personal_search/service.py)：检索打分、澄清会话、动作执行核心服务
+- [src/edge_cloud_agent/personal_search/ingest.py](src/edge_cloud_agent/personal_search/ingest.py)：目录扫描、增量导入与幽灵文件清理
+- [src/edge_cloud_agent/personal_search/vector_index.py](src/edge_cloud_agent/personal_search/vector_index.py)：FAISS 向量索引封装（不可用时自动回退）
+- [src/edge_cloud_agent/personal_search/storage.py](src/edge_cloud_agent/personal_search/storage.py)：个人文件 JSONL 存储（批量落盘 + 原子写）
+- [src/edge_cloud_agent/personal_search/schemas.py](src/edge_cloud_agent/personal_search/schemas.py)：个人文件搜索请求与响应模型
+- [src/edge_cloud_agent/text_utils.py](src/edge_cloud_agent/text_utils.py)：共享分词器（两条业务线统一口径）
+- [tests/](tests/)：业务层单测（35 例，`pytest tests/`）
 - [requirements.txt](requirements.txt)：依赖
 - [.env.example](.env.example)：环境变量模板
 
@@ -343,14 +351,18 @@ CLOUD_ENABLED=true CLOUD_API_BASE=https://your-endpoint/v1 make run
 
 ## 7. 场景化产品目标（V1）
 
-1. 先只打通「报销」这个场景，做成三动作闭环：
+V1 打通两个端侧场景，业务层设计与现状详见 [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md)。
+
+1. 「报销」三动作闭环：
    - 收进来：用户把材料分享给助手，立即可检索
    - 找回来：关键词/时间段/金额快速检索
    - 拿出去：导出可提交的材料清单
-2. 复盘指标（只看“用户再次回来”）：
-   - 同一 `claim_id` 14 天内再次使用 search/export 的占比
-   - 收集后 1 小时内补齐材料的成功率
-   - 用户对自动抽取字段的纠正次数（越少越好）
+2. 「个人文件搜索」消歧闭环（search → clarify → execute）：
+   - 模糊口述（“上周群里发的聚餐照片”）→ 追问收敛 → 命中后动作（打开/分享/对比/备注/归档）
+   - 已接通 Android MVP 客户端（见下文 §10）
+3. 复盘指标（只看“用户再次回来”）：
+   - 报销：同一 `claim_id` 14 天内再次使用 search/export 的占比；收集后 1 小时内补齐材料的成功率；用户对自动抽取字段的纠正次数（越少越好）
+   - 文件搜索：追问后最终 resolved 并执行动作的会话占比（指标口径待定，暂无采集代码）
 
 
 
@@ -374,6 +386,7 @@ make install
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md)：业务层梳理（报销/个人文件搜索）与遗留清单
 
 ---
 
@@ -413,7 +426,7 @@ CLOUD_MODEL_ID=<云端模型 id>
 
 ---
 
-## 7. Android APK (端侧首版)
+## 10. Android APK (端侧首版)
 
 本仓库新增了 Android MVP 客户端，目录：`android/`。
 
