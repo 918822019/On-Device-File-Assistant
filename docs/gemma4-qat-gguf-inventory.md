@@ -25,9 +25,13 @@ general.base_model.0.repo_url = https://huggingface.co/google/gemma-4-E2B-it
 
 ## 2. 张量清单（按类归并，×N 表示层数）
 
-⚠️ **GGUF 的 dims 是 [in, out]，与 HF 的 [out, in] 相反。**
-例如 `blk.0.attn_q.weight` 在 GGUF 里是 `[1536, 2048]`，
-而 HF 的 `self_attn.q_proj.weight` 是 `[2048, 1536]`。转换时必须转置。
+⚠️ **GGUF 的 dims 标签是 [in, out]，与 HF 的 [out, in] 相反 —— 但数据
+不需要转置，只需把 dims 标签反序。** GGUF 的 `ne[0]` 是最快轴，
+`ne=[in,out]` ⇒ 内存里**已经是 [out,in] 行主序**，恰好就是我们的 .tqwen 布局。
+例如 `blk.0.attn_q.weight` 的 dims 是 `[1536, 2048]`，而它的内存布局与
+HF `self_attn.q_proj.weight` `[2048, 1536]` 逐字节相同。
+实测对照见 §5.1 ③（转置方案相对 L2 = 120% ≈ 两个无关向量的 √2）。
+⚠️ 「dims 是反的」极易被误读成「数据要转置」，一旦转置会静默毁掉全部权重。
 
 | GGUF dtype | ×N | dims (GGUF 顺序) | 名字 |
 |---|---|---|---|
@@ -37,12 +41,12 @@ general.base_model.0.repo_url = https://huggingface.co/google/gemma-4-E2B-it
 | **Q6_K (14)** | 1 | [8960, 262144] | **`per_layer_token_embd.weight`** ← PLE 表 |
 | F32 (0) | 1 | [256] | `rope_freqs.weight` |
 | **Q6_K (14)** | 1 | [1536, 262144] | **`token_embd.weight`** ← embed（tied lm_head） |
-| Q4_0 (2) | 35 | [1536, 2048] | `blk.N.attn_q.weight` |
-| Q4_0 (2) | 15 | [1536, 256] | `blk.N.attn_k.weight` ← 只有非共享层有 |
-| Q4_0 (2) | 15 | [1536, 256] | `blk.N.attn_v.weight` ← 只有非共享层有 |
-| Q4_0 (2) | 35 | [2048, 1536] | `blk.N.attn_output.weight` |
-| F32 (0) | 35 | [256] | `blk.N.attn_q_norm.weight` |
-| F32 (0) | 15 | [256] | `blk.N.attn_k_norm.weight` ← 只有非共享层有 |
+| Q4_0 (2) | **28 + 7** | [1536, 2048] / **[1536, 4096]** | `blk.N.attn_q.weight` ← sliding 28 层 / **full 7 层** |
+| Q4_0 (2) | **12 + 3** | [1536, 256] / **[1536, 512]** | `blk.N.attn_k.weight` ← 只有非共享层（0..14）有 |
+| Q4_0 (2) | **12 + 3** | [1536, 256] / **[1536, 512]** | `blk.N.attn_v.weight` ← 同上 |
+| Q4_0 (2) | **28 + 7** | [2048, 1536] / **[4096, 1536]** | `blk.N.attn_output.weight` |
+| F32 (0) | **28 + 7** | [256] / **[512]** | `blk.N.attn_q_norm.weight` |
+| F32 (0) | **12 + 3** | [256] / **[512]** | `blk.N.attn_k_norm.weight` ← 只有非共享层有 |
 | F32 (0) | 35 | [1536] | `blk.N.attn_norm.weight` |
 | F32 (0) | 35 | [1536] | `blk.N.post_attention_norm.weight` |
 | F32 (0) | 35 | [1536] | `blk.N.ffn_norm.weight` |
@@ -55,10 +59,25 @@ general.base_model.0.repo_url = https://huggingface.co/google/gemma-4-E2B-it
 | Q4_0 (2) | 35 | [256, 1536] | `blk.N.proj.weight` ← PLE 子块 projection |
 | F32 (0) | 35 | [1] | `blk.N.layer_output_scale.weight` ← `layer_scalar` |
 
+⚠️ **本表最初把逐层变化压平了**（写成 `attn_q` ×35 全 `[1536,2048]`、
+`attn_k_norm` ×15 全 `[256]`），照它写转换器会有 **10 个张量形状错**。
+上表是重新解析全部 541 个张量后的实测分布。
+
+**head_dim 是逐层变的**：full 层（head_dim 512）= **{4, 9, 14, 19, 24, 29, 34}
+共 7 层**，其余 28 层是 sliding（head_dim 256）。这 7 个下标与
+`gemma4.attention.sliding_window_pattern` 里 False 的位置**完全一致**（§4）。
+ffn 则是前 15 层窄（6144）、后 20 层宽（12288）。
+
 **KV 共享层（15..34，共 20 层）没有 `attn_k` / `attn_v` / `attn_k_norm`**，
 所以这三类各只有 15 份 —— 与我们 `is_dead_kv_weight` 过滤死权重后的结果
 （540 张量 + 1 个 V4 扩展 = 541）**完全一致**。这是两条独立路径对同一
 架构事实的交叉验证。
+
+✅ **转换器已把这条交叉验证做成了强制门禁**：把 GGUF 张量表经名字映射后，
+与 `read_plan_from_dir`（HF config.json + safetensors 元数据）产出的计划
+逐张量比对，集合差与 shape 差都必须为 0，否则拒绝转换。
+实测：**540 个张量，集合差 0、shape 差 0**，唯一有意跳过的是
+`rope_freqs.weight`（forward 现算 inv_freq，不落盘）。
 
 ### 量化方案（Google 官方的选择）
 
@@ -157,11 +176,45 @@ partial_rotary_factor 为准**，并用 `rope_freqs.weight` 的实际长度（25
 ```
 每块 32 个值 = 2 字节 fp16 scale(d) + 16 字节 nibble
 dequant: w[i] = d * (q[i] - 8)          q ∈ [0,15]，**对称**（zero 恒 8）
-nibble 序：低 nibble 在前（qs[i] = q[2i] | (q[2i+1] << 4)）
+⚠️ nibble 配对**与我们不同**，见下方「必须重排」
 ```
-⇒ **与我们的 `Dtype::kI4` 布局直接对应**：group_size=32、zero=8.0、
-低 nibble 在前（`dequant_i4_row` 的 `(i%2==0) ? p&0xF : p>>4` 完全一致）。
-转换只是把每块的 2 字节 scale 扩成我们的 4 字节头 `[scale_fp16 | zero_fp16=8.0]`。
+
+⚠️⚠️ **nibble 必须重排。本节最初写的是「低 nibble 在前
+（qs[i] = q[2i] | (q[2i+1] << 4)），与我们的 kI4 布局直接对应，
+转换只是把 2 字节 scale 扩成 4 字节头」—— 那是错的，已按实测改正。**
+
+llama.cpp 的 `dequantize_row_q4_0`：
+
+```c
+for (j = 0; j < QK4_0/2; ++j) {
+    y[j]           = d * ((qs[j] & 0xF) - 8);
+    y[j + QK4_0/2] = d * ((qs[j] >>  4) - 8);   // ← 相距 16，不是相距 1
+}
+```
+
+即 Q4_0 **一个字节里的两个 nibble 相距 16**（低 = 位置 j，高 = 位置 j+16）；
+而我们 `kernels/ref_ops.h` 的 `dequant_i4_row` 是
+`(i%2==0) ? packed[i/2]&0xF : packed[i/2]>>4`，即**相距 1**
+（低 = 位置 2i，高 = 位置 2i+1）。两者不同，正确的重排是（`i < 8`）：
+
+```
+packed[i]     = (qs[2i] & 0xF) | ((qs[2i+1] & 0xF) << 4)
+packed[8 + i] = (qs[2i] >>  4) | ((qs[2i+1] >>  4) << 4)
+```
+
+scale 两字节**原样保留**（那是 QAT 训出来的，动它就白做 QAT 了）；
+zero 两字节写 fp16(8.0) = `00 48`（⚠️ 不是 `00 41`；我第一版手算错了，
+被自测里的断言当场抓住 —— 所以那个断言是「反解回 8.0」而不是「等于某常量」）。
+
+实测（`tools/selftest_gguf_transcode.py`，含变异测试）：
+
+| 做法 | 与 `gguf.quants.dequantize` 逐位一致 |
+|---|---|
+| **重排后** | 合成 **200/200** + 8 个真实张量全过 |
+| 直接拷贝 qs（本节原来的说法） | **0/200**，平均相对误差 **133.9%** |
+
+133.9% 已接近「两个无关同范数向量」的 √2 ≈ 141% —— 照错的做等于把
+**全部 matmul 权重换成垃圾**，而形状合法、不报错、输出是「通顺的乱码」。
 
 ⇒ **顺带解锁 `sdot5_mt`**：该 kernel 要求对称量化（zero 恒 8），
 Q4_0 天然满足，而它比 `sdot4_mt` 少算 zero 修正项与激活前缀和。
@@ -190,7 +243,29 @@ PLE 表本来留盘、f16 行读已实现（`ple_dtype_ == kF16` 分支）。
 `block_q6_K`。块大小实测 `GGML_QUANT_SIZES`：Q4_0 = (32, 18)、
 **Q6_K = (256, 210)**，210 = ql[128] + qh[64] + scales[16] + d[2]，
 与 §5 推的布局一致。
-（注意 `dequantize` 收 `np.ndarray` 而不是 `bytes`，要先 `np.frombuffer(..., np.uint8)`。）
+（注意 `dequantize` 收 `np.ndarray` 而不是 `bytes`，要先 `np.frombuffer(..., np.uint8)`。
+且 `dequantize` 返回的是**扁平** f32，要自己按 `reshape(rows, ne[0])` 重塑。）
+
+**①bis ⚠️ Q6_K → f16 不是无损的（§5 与下面 ① 原来都说「精度升格故无损」，
+那个推理是错的）。** 错在只数了 Q6_K 值域的 6 位，没注意它的值是
+`d(fp16) × 6-bit 子块 scale × (q-32)` —— **两个量化量的乘积**最多需要
+11+6+6 ≈ 23 位尾数，f16 的 11 位装不下。实测：
+
+| | `token_embd` | `per_layer_token_embd` |
+|---|---|---|
+| 非零元素被 f16 改动的比例 | 64.7 ~ 72.5% | 75.7 ~ 76.8% |
+| 相对误差 中位 / 均值 | 1.48e-4 / 1.57e-4 | 1.57e-4 / 1.66e-4 |
+| max | 4.866e-4 | 4.880e-4 |
+| 超过 1 ULP(2^-10) 的元素 | **0** | **0** |
+
+即误差**严格限于 f16 的 1 ULP（2^-11 = 4.883e-4）**。
+判定「可接受」的依据是与已测过的敏感度对比：PLE 表走 i4（权重误差 ~9.6%）
+实测只值 0.56 个 argmax 一致率点，而这个扰动比它小约 **600 倍**。
+要逐位无损只有两条路：存 f32（PLE 8.75 GiB 磁盘，常驻内存不变），
+或在 C++ 侧实现原生 Q6_K dtype（新 kernel + 绑定 + 流式路径）。
+
+⇒ **验收标准 ① 对 f16 张量必须比 `float16(dequantize)` 而不是 `dequantize`**
+（转换器里就是这么写的）；对 i4 与 f32 张量则是严格逐位一致。
 
 **② 张量表结束于 15,815,534，数据区起点 15,815,552**（64 B 对齐）。
 即 §1 的「Range 取前 16 MB 就够」是**刚好够**——词表 262144 个 token 使
@@ -252,12 +327,15 @@ A 的 34% 明显有结构 ⇒ **A 正确**。
 3. **Q6_K → f16**：按 `block_q6_K` 实现，是主要工作量与主要风险。
    验证方式：先与 llama.cpp 对同一张量反量化结果逐位对照
    （不要只靠"看起来对"）。
-4. **名字映射 + 转置**（dims 反序）。
+4. **名字映射 + dims 标签反序（数据不转置，见 §5.1 ③）**。
+   ✅ 已完成，并做成强制门禁：与 HF 侧 `read_plan_from_dir` 的计划
+   逐张量比对，实测 540 个张量集合差 0、shape 差 0。
 5. **V4Ext 合成**：从 GGUF 元数据生成，`ple_row_bytes` 按 PLE 的
    **目标 dtype**（f16 ⇒ 8960×2 = 17920）算，不能用文件主 dtype。
 6. **EOS 用 106 而不是 GGUF 的 1**（见 §4 的警告）。
-7. 用 `tools/eval_i4_quality.py` 验收：argmax 一致率目标 ≥95%
-   （f16 基线 97.57%）。**不要用 PPL**（softcapping 下无效，见 §5.6）。
+7. 验收。**不要用 PPL**（softcapping 下无效，见 §5.6）；
+   也**不要**用「vs 原始 HF 的 argmax 一致率」（QAT 权重已训漂，见 §5.1 ④）。
+   正确口径见 §5.1 末尾的两条，实测结果见 §8。
 
 ## 7. 未选的替代方案
 
@@ -271,3 +349,129 @@ unsloth 的 imatrix 动态量化，质量通常高于 q4_0）与 `UD-Q2_K_XL`（
 是 2-bit，体积最小但质量风险最高，且同样是 Q2_K 超块格式。
 它还带 MTP（multi-token prediction）权重 —— 那是一种投机解码 drafter，
 与本项目「gemma4 不做投机解码」的既定决策不符，不需要。
+
+---
+
+## 8. 转换结果与实测（#28 已完成）
+
+工具：`tools/gguf_reader.py`（GGUF v3 读取器）、
+`tools/gguf_to_tiny_gemma4.py`（转换器）、
+`tools/materialize_qat_hf.py`（造 QAT 参考 checkpoint）、
+`tools/selftest_gguf_transcode.py`（含变异测试的自测）。
+
+```
+python tools/gguf_to_tiny_gemma4.py \
+    --gguf   models/ms_cache/google/gemma-4-E2B-it-qat-q4_0-gguf/gemma-4-E2B_q4_0-it.gguf \
+    --hf-dir models/google/gemma-4-E2B-it \
+    --out    models/tiny/gemma4-qat-q4_0.tqwen --verify
+```
+
+| | 值 |
+|---|---|
+| 输出文件 | `models/tiny/gemma4-qat-q4_0.tqwen` |
+| 文件总字节 | **6,696,074,240**（6.24 GiB） |
+| 常驻权重 | **1905.87 MB** |
+| PLE 留盘 | 4480.00 MB（f16，`--ple-ssd`，**不占常驻内存**） |
+| 峰值 RSS | **2,026,143,744 B = 1.887 GiB** |
+| group_size | **32**（Q4_0 定死，不是可调参数） |
+| zero | 恒 **8.0** ⇒ 对称 ⇒ `sdot5_mt` 可用 |
+| EOS | 106（取自 HF config 的 `[1,106]` 末位，**不是** GGUF 的 1） |
+| 转换耗时 | **9~11 s** |
+
+常驻 1906 MB 比旧 RTN i4 的 1776 MB 多 **7.3%**，两处可解释：
+① group_size 64→32 使 i4 从 4.5 bpw 变 5.0 bpw（+11%，约 +108 MB）；
+② `per_layer_model_projection` 官方保 F16 而我们原来量化成 i4（+20 MB）。
+
+### 8.1 验收 ①：转换保真度 —— 通过
+
+`--verify` 把写好的 .tqwen 读回来解码，与 `gguf.quants.dequantize` 对照：
+**540 个张量全部一致**（i4/f32 严格逐位；f16 比 `float16(dequantize)`，
+见 §5.1 ①bis 的 1-ULP 论证）。
+
+i4 的解码用 `verify_i4_roundtrip.dequant_i4_py` —— 那是照抄 C++
+`dequant_i4_row` 逐行翻译的**独立**实现，刻意不复用导出器代码，
+否则导出器与验证器一起错就对照不出来。
+
+### 8.2 验收 ②：任务质量 —— 通过（门槛 95%）
+
+参考 = `materialize_qat_hf.py` 造的 **HF bf16 QAT checkpoint**
+（权重 = GGUF 反量化值，config/tokenizer 复制原始 checkpoint）。
+造好后 `eval_i4_quality.py` 零改动可用，只换 `--hf-dir`。
+
+⚠️ 该参考加载时会报 audio/vision 塔 MISSING 并随机初始化 —— 只含语言塔是
+有意的，随机初始化不影响纯文本前向，只多占约 0.9 GB。
+
+**名字映射的正确性另有独立验证**：QAT 没漂移的张量，materialize 后应与
+原始 checkpoint 吻合，且漂移量要复现 §5.1 ④ 那张表。实测 5 个张量
+**逐个精确复现**（0.000 / 0.525 / 0.533 / 0.792 / 17.123%）。
+这一步是必要的：5 个 norm 的名字错位得很厉害而形状都是 [1536]，
+接错了不会报形状错，只会静默劣化。
+
+语料 = f16 模型 greedy 生成的 534 token（与 §5.4/§5.5.2 的 PTQ 评测同一份：
+本次对照运行**精确复现**了 f16 = 97.57%、rtn-i4 = 60.11% 两个旧数字，
+证明语料逐 token 相同、口径可比）。
+
+| 配置 | 参考 | argmax 一致率 | margin 中位 | decode |
+|---|---|---|---|---|
+| f16（原始权重） | HF-**原始** bf16 | **97.57%** ← 精度地板 | 2.67 | 30.70 ms/tok（32.6 tok/s） |
+| rtn-i4（RTN gs=64, sdot4_mt） | HF-原始 bf16 | 60.11% | 2.39 | 20.36 ms/tok（49.1） |
+| **qat `neon_mt`（W4A32）** | HF-**QAT** bf16 | **97.75%** ✅ | 1.70 | 61.5 ms/tok（16.3） |
+| qat `sdot5_mt`（W4A8 对称） | HF-QAT bf16 | 88.95% | 1.61 | **21.43 ms/tok（46.7）** |
+| qat `sdot4_mt`/`sdot3_mt`/`sdot2_mt`/`sdot_mt` | HF-QAT bf16 | 88.20% | 1.66 | 23.78 ms/tok（42.0） |
+| f16（原始权重） | HF-**QAT** bf16 | 65.92% | 2.67 | — ← **QAT 漂移量本身** |
+
+（速度均为**顺序单独运行**、固定 128 个 decode token、EOS 关闭时测得。
+⚠️ 并发跑多个进程会把数字污染到 2~3 倍差 —— 我第一次三个内核并跑，
+decode 从 21 ms/tok 变成 38 ms/tok。）
+
+**结论：QAT 把 argmax 一致率从 PTQ 的 60.11%（最好 64.42%）拉到 97.75%，
+已在 f16 精度地板 97.57% 之上 ⇒ 4-bit 权重本身几乎不再损失质量。**
+
+最后一行 65.92% 是这次最有价值的对照：它是**转换零误差**的情况
+（HF bf16 直接前向，没有我们的引擎参与），却只有 65.92%。
+⇒ 「vs 原始模型的一致率」这个判据对 QAT **物理上不可能达到 95%**，
+它量的是 QAT 的 4-bit 权重与原模型之差，而不是转换质量。§5.1 ④ 的判断被实测坐实。
+
+### 8.3 W4A8 的激活量化成了新瓶颈
+
+RTN 时代 W4A8（60.11%）与 W4A32（61.99%）只差 **1.9 点**；
+QAT 下 W4A8（88.20~88.95%）与 W4A32（97.75%）差 **8.8~9.6 点**。
+原因：QAT 已把**权重**量化误差压到近零，于是 W4A8 剩下的主要误差源
+变成了**激活的 int8 量化**，之前它被巨大的权重误差掩盖了。
+
+四个 W4A8 变体（sdot/sdot2/sdot3/sdot4 的 _mt）给出**完全相同**的
+88.20% 与 margin 1.66 —— 这是预期的一致性检查（它们是同一数学的逐级优化，
+数值等价）。`sdot5_mt` 的 88.95% 差 4 个位置，是去掉 zero 修正项后
+f32 累加顺序不同导致的近平局翻转，不是 bug。
+
+**但 88.95% 在文本上并不可见地劣化。** 同一个 prompt：
+
+> `neon_mt`（97.75%）：内存带宽是指\*\*内存单位时间内可以传输的数据量\*\*，**它**决定了数据在处理器和内存之间传输的速度。
+> `sdot5_mt`（88.95%）：\*\*内存带宽是指内存单位时间内可以传输的数据量，决定了数据在处理器和内存之间传输的速度。\*\*
+
+两者语义完全相同，差别只在 **markdown 加粗的范围**和一个「它」字
+（`1018` = `**`、`238010` = `它`）。
+⇒ 那 11 个点的不一致**集中在低风险的格式/近平局位置**，不在内容上。
+argmax 一致率会系统性过度惩罚这类位置 —— 用它当唯一判据时，
+88.95% 听起来像「不可用」，实际不是。
+
+### 8.4 部署取舍（未决，见 §9）
+
+| 方案 | 一致率 | decode | 常驻 | RSS | 评价 |
+|---|---|---|---|---|---|
+| f16 | 97.57% | 32.6 tok/s | 4348 MB | 4.54 GiB | 6 GB 机放不下 |
+| QAT + `neon_mt`（W4A32） | **97.75%** | 16.3 tok/s | 1906 MB | 1.89 GiB | 质量最好，但 W4A32 只有 31 GB/s 有效带宽（f16 是 84%×185 GB/s），说明 i4 的 `neon_mt` 是**计算受限**、内核未优化 |
+| QAT + `sdot5_mt`（W4A8） | 88.95% | **46.7 tok/s** | 1906 MB | 1.89 GiB | 最快，质量在文本上看不出差别 |
+
+i4 的价值是**内存**（1.89 vs 4.54 GiB）而不是速度 —— 这点没变。
+
+## 9. 遗留项
+
+1. **W4A32 的 i4 内核未优化**：`neon_mt` 只有 16.3 tok/s、有效带宽 31 GB/s，
+   而 f16 的 `neon_mt_kv_nt` 能到 84%×185 GB/s。i4 读得更少却更慢，
+   说明瓶颈在反量化的 ALU 而非带宽。优化它就能同时拿到 97.75% 与高速。
+2. **W4A8 的激活精度**：若走 `sdot5_mt`，可考虑把激活量化提到 int16
+   或做 per-group 激活缩放，把 88.95% 拉回 95%+。
+3. **`unsloth` 的 `UD-Q4_K_XL`**（2499 MiB，imatrix 动态量化，质量通常高于
+   q4_0）仍未试；Q4_K 是超块格式，读取器工作量比 Q4_0 大一个数量级（§7）。
+4. **Android 真机**（#24）仍阻塞在无设备。
