@@ -5,6 +5,11 @@ python-dotenv==1.0.1
 requests==2.32.3
 torch==2.6.0
 transformers==5.17.0
+# GGUF 读取（#28：官方 QAT 权重 google/gemma-4-E2B-it-qat-q4_0-gguf 转 .tqwen）。
+# 只用它的 quants.dequantize 与 constants，不引入 llama.cpp。
+# 关键价值：提供 Q4_0 / Q6_K 的 numpy 参考实现，避免自己按记忆实现 block_q6_K
+# （256 值/超块、6-bit scale 打包，写错是静默乱码）。
+gguf==0.19.0
 accelerate==1.5.1
 bitsandbytes==0.42.0
 modelscope==1.20.0

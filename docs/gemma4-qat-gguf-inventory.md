@@ -181,6 +181,68 @@ PLE 表本来留盘、f16 行读已实现（`ple_dtype_ == kF16` 分支）。
 这样只需实现 Q6_K → f16 一个方向，不需要 Q6_K → i4 的再量化
 （再量化会毁掉 QAT 训练出来的 scale，是净损失）。
 
+## 5.1 已验证的事实（下载后实测，不是推测）
+
+下载完整文件（3,349,516,256 B）并装了 `gguf` 0.19.0 之后实测确认：
+
+**① `gguf.quants.dequantize` 提供 Q4_0 与 Q6_K 的 numpy 参考实现**，
+故 §5 里「Q6_K 不能凭记忆写」的风险**已消除**——直接用它，不必自己实现
+`block_q6_K`。块大小实测 `GGML_QUANT_SIZES`：Q4_0 = (32, 18)、
+**Q6_K = (256, 210)**，210 = ql[128] + qh[64] + scales[16] + d[2]，
+与 §5 推的布局一致。
+（注意 `dequantize` 收 `np.ndarray` 而不是 `bytes`，要先 `np.frombuffer(..., np.uint8)`。）
+
+**② 张量表结束于 15,815,534，数据区起点 15,815,552**（64 B 对齐）。
+即 §1 的「Range 取前 16 MB 就够」是**刚好够**——词表 262144 个 token 使
+kv 区长达 15.8 MB。取 4 MB 会在解析 `tokenizer.ggml.tokens` 时越界报错。
+
+**③ 布局：数据不需要转置，只需把 dims 标签反序。**
+GGUF 的 `ne[0]` 是最快轴，而 `ne = [in, out]`，所以内存里已经是
+`[out, in]` 行主序 —— 恰好就是我们的 .tqwen 布局。实测（`blk.0.attn_k.weight`
+Q4_0，dims=[1536,256]，对照原始 HF 的 `k_proj.weight` [256,1536]）：
+
+    A 不转置 reshape[dims[1], dims[0]]  相对 L2 =  34.14%
+    B 转置                              相对 L2 = 120.32%
+
+B 的 120% 已接近「两个无关同范数向量」的 √2 ≈ 141%，即完全不相关；
+A 的 34% 明显有结构 ⇒ **A 正确**。
+⚠️ 这是个高价值陷阱：「dims 是反的」很容易被误解成「数据要转置」，
+一旦转置就静默毁掉全部权重（形状仍然合法，不报错）。
+
+**④ QAT 把权重训漂了 —— 这改变了验收标准。**
+用**未量化的 F32 张量**做控制组（不含任何量化误差），对照原始 HF checkpoint：
+
+| GGUF 张量 | 对应 HF | 相对 L2 差异 |
+|---|---|---|
+| `blk.0.attn_k_norm.weight` | `layers.0.self_attn.k_norm.weight` | **0.000%（逐位相同）** |
+| `blk.0.attn_norm.weight` | `layers.0.input_layernorm.weight` | 0.525% |
+| `blk.7.ffn_norm.weight` | `layers.7.pre_feedforward_layernorm.weight` | 0.533% |
+| `output_norm.weight` | `model.norm.weight` | 0.792% |
+| `blk.0.layer_output_scale.weight` | `layers.0.layer_scalar` | **17.123%**（0.02087 vs 0.01782） |
+
+`attn_k_norm` 逐位相同**证明我的 GGUF 解析与布局是对的**（否则不可能精确匹配）；
+而其余张量的差异就是 **QAT 训练造成的权重漂移**，`layer_scalar` 漂了 17%。
+上面 A 方案那 34% 的相对差 = QAT 漂移 + Q4_0 量化误差，两者叠加，
+**不是转换错误**。
+
+⇒ **`tools/eval_i4_quality.py` 的判据（argmax 一致率 vs 原始 HF bf16）
+对 QAT 模型无意义。** 那个判据只对 PTQ 成立：PTQ 的目标是逼近原模型，
+所以「与原模型的一致率」是对的量；而 QAT 是**另一个模型**，
+它不追求逼近原模型，只追求自己在 4-bit 下好用。
+拿 QAT 去比原模型，量到的是 QAT 训练的漂移量，与转换正确性无关。
+
+**QAT 的验收标准应改为两条：**
+1. **转换保真度**：转换后的 .tqwen 反量化值必须与 GGUF 的
+   `quants.dequantize` 结果逐位一致（Q4_0 是无损转码，见 §5；
+   Q6_K→f16 是精度**升格**，f16 的 11 位尾数多于 Q6_K 的 ~6 位，
+   故也应无损）。这条能验证转换器，且与原模型无关。
+2. **任务质量**：直接用 QAT 模型生成、看输出是否连贯正确；
+   或与 llama.cpp 跑同一个 GGUF 的输出对照（同权重、不同引擎，
+   差异应只来自算子实现）。
+   可选的定量口径：把 QAT 的 F32 张量（norm/layer_scalar）与
+   Q4_0/Q6_K 反量化结果一起灌回 HF 模型结构，得到「QAT 的 fp32 等价模型」，
+   再以它为参考算 argmax 一致率 —— 这才是与 PTQ 可比的口径。
+
 ## 6. 转换器的工作量与顺序
 
 1. **GGUF 读取器**：头部（magic/version/张量数/kv 数）→ kv 对（含 ARR/STR
