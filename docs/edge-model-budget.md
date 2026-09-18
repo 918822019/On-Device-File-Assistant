@@ -139,6 +139,12 @@ KV cache（int8，已计入 `num_kv_shared_layers = 20`）：
 
 **上下文不是内存瓶颈**——8K 只占 27 MiB。这是单 KV 头 + 80% 层 sliding window + KV 共享三者叠加的结果。
 
+> **精算修正**：上表按「独立层比例 (35−20)/35 = 0.43」粗估。在
+> [gemma4-reference-spec.md](gemma4-reference-spec.md) §3.6 查明 KV 共享的确切结构后
+> （自有 KV 仅层 0–14，共享方只有 layer 13/14，且 layer 13 虽是 sliding 层却需一份额外的
+> **全长**副本），精算值为 2K=10 MiB / 8K=**31 MiB** / 32K=115 MiB（int8）。
+> 与粗估差约 15%，**结论不变**：上下文远不是瓶颈，权重才是。
+
 ### 常驻 RAM 汇总（Q4_K_M，ctx = 8K）
 
 | 方案 | 常驻权重 | KV | 运行时开销 | **RAM 合计** | 磁盘 |

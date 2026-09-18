@@ -81,16 +81,27 @@ self_attn.{q,k,v,o}_proj / {q,k}_norm          （维度见 §2.2）
 
 ### 2.5 两个必须从 HF 参考实现推导、不可猜的点
 
-1. **`layer_scalar`**：逐层一个 bf16 标量，且**各层取值不同**（实测 layer0=0.0178、
-   layer1=0.2227、layer2=0.7930、layer3=0.2871、layer4=0.4980、layer14=0.0286…）。
-   Qwen 全系没有这个张量，其作用（残差缩放？输出门控？）必须读
-   `transformers` 的 `Gemma4TextModel` 实现确认。
-2. **PLE 的组合公式**：gemma4 用的是
-   `per_layer_input_gate` [256,1536] + `per_layer_projection` [1536,256] +
-   `post_per_layer_input_norm` [1536] + 全局 `per_layer_model_projection` [8960,1536] +
-   `per_layer_projection_norm` [256]。
-   **checkpoint 里没有任何 `altup_*` / `laurel_*` 张量**，即 gemma4 的 PLE 与
-   gemma3n 的 AltUp/Laurel 不是同一套机制，不能照搬 llama.cpp 的 altup 路径。
+> **已完成**：两项均已从 `transformers/models/gemma4/modeling_gemma4.py`（5.17.0）
+> 逐行摘出并与 checkpoint 交叉验证，完整公式见
+> **[docs/gemma4-reference-spec.md](gemma4-reference-spec.md)**。结论摘要：
+
+1. **`layer_scalar`**：在 `Gemma4TextDecoderLayer.forward` 的**最末尾**
+   （`modeling_gemma4.py:1440`）对整层输出做标量乘法 `hidden_states *= self.layer_scalar`。
+   它是 `nn.Buffer(torch.ones(1))`（`:1367`，初始化 `:1510`），但 checkpoint 里是训练后的
+   非 1 值（layer0=0.0178、layer2=0.7930、layer14=0.0286…），**必须逐层读取**。
+2. **PLE 的组合公式**：gemma4 用的是「上下文分量 + token 分量」双路合并，
+   与 gemma3n 的 AltUp/Laurel **不是同一套机制**（checkpoint 里无任何 `altup_*`/`laurel_*`
+   张量），不能照搬 llama.cpp 的 altup 路径。精确流程：
+   ```
+   P = per_layer_model_projection(inputs_embeds) * 1536**-0.5   → reshape [B,S,35,256]
+   P = per_layer_projection_norm(P)                             # RMSNorm(256)
+   T = embed_tokens_per_layer(input_ids) * 16.0                 → reshape [B,S,35,256]
+   per_layer_inputs = (P + T) * 2**-0.5
+   # 第 i 层取 per_layer_inputs[:,:,i,:]，在 decoder layer 末尾作为第三个残差子块：
+   #   gate(1536→256) → gelu_tanh → ×per_layer_input → proj(256→1536) → RMSNorm → +residual
+   ```
+   **注意 `act_fn` 是 `gelu_pytorch_tanh` 而非 SiLU**，且 PLE 子块位于 attention 与 MLP
+   **之后**，是每层的第三个残差块（Qwen 只有两个）。
 
 > 附带：`text_config` 是逐层异构的，直接读 `config.text_config.head_dim` 会抛
 > `AmbiguousGlobalPerLayerAttributeError`，需经 `per_layer_config[i]` 访问。
@@ -296,11 +307,27 @@ PLE 贡献恰好是**一整行连续的 17.9 KB**。
 可能需要行级小 LRU（`ExpertStore` 的 Slot/LRU 可泛化，但当前 `make_key` 是
 `layer<<20|expert`，`expert_store.h:182-184`）或 `POSIX_FADV_WILLNEED` 预取。
 
-### R4 — `layer_scalar` 与 PLE 组合公式不可猜
+### R4 — `layer_scalar` 与 PLE 组合公式（已解除，转为对齐验证）
 
-见 §2.5。必须读 transformers 的 `Gemma4TextModel` / `Gemma4TextLayer` 参考实现，
-逐算子对齐。**建议第一步就做 `make_fake_gemma4_model.py` + `align_fake_gemma4_model.py`**，
-用随机小模型把公式钉死，再碰真权重。
+原先的风险是「公式靠猜 → 能跑不崩溃但输出垃圾」。**现已从
+`modeling_gemma4.py` 逐行摘出并与 checkpoint 交叉验证**，见
+[docs/gemma4-reference-spec.md](gemma4-reference-spec.md)。
+
+但该文档 §7 同时列出**七处同类静默数值陷阱**，其中三处是本次新发现、
+架构勘察未覆盖的：
+
+1. **attention `scaling = 1.0`**（`:1178` 硬编码），不是常规的 `head_dim**-0.5`。
+   漏掉会让注意力分布差 16 倍（sliding）或 22.6 倍（full）
+2. **主 embed 要 ×sqrt(1536)=39.19**（`:1575-1577`，`Gemma4TextScaledWordEmbedding`）
+3. **激活是 `gelu_pytorch_tanh`，而 tiny-llm 只有 SiLU/SwiGLU kernel**
+   （`kernels/silu/` 下三个文件，`qwen_forward_token.cpp:468` 的 FFN 硬编码 SwiGLU）
+   → **必须新写 gelu_tanh + GEGLU 融合算子（ref + neon）**。
+   这推翻了架构勘察「i4 kernel 与架构无关故零新 kernel」的结论：matvec 确实零新增，
+   但**激活函数需要新 kernel**
+
+因此阶段 0 的对齐脚本除了比对最终 logits，还必须**单独比对 PLE 子块的中间量**
+`per_layer_inputs[:,:,i,:]`——因为陷阱 2/3 的误差会被后续残差稀释，
+只比最终 logits 可能看不出来。验收门槛见 spec §8。
 
 ### R5 — 后端接口波及
 
