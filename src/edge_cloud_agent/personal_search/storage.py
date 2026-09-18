@@ -148,3 +148,63 @@ class PersonalFileStore:
                 file.write(json.dumps(item.to_dict(), ensure_ascii=False))
                 file.write("\n")
         os.replace(tmp_path, self.path)
+
+
+class FileStateStore:
+    """备注与归档标记的持久化存储（JSON 单文件，原子写）。
+
+    此前 annotations/archived 只存在 service 的内存 dict/set 里，重启即丢。
+    文件格式：{"annotations": {file_id: note}, "archived": [file_id, ...]}
+    损坏时从空状态起步，不阻塞服务启动。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path).resolve()
+        self._lock = Lock()
+        self._annotations: dict[str, str] = {}
+        self._archived: set[str] = set()
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            annotations = payload.get("annotations") or {}
+            if isinstance(annotations, dict):
+                self._annotations = {str(k): str(v) for k, v in annotations.items()}
+            archived = payload.get("archived") or []
+            if isinstance(archived, list):
+                self._archived = {str(item) for item in archived}
+        except Exception:
+            self._annotations = {}
+            self._archived = set()
+
+    def _persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "annotations": self._annotations,
+            "archived": sorted(self._archived),
+        }
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, self.path)
+
+    def set_annotation(self, file_id: str, note: str) -> None:
+        with self._lock:
+            self._annotations[file_id] = note
+            self._persist()
+
+    def get_annotation(self, file_id: str) -> str | None:
+        return self._annotations.get(file_id)
+
+    def set_archived(self, file_id: str) -> None:
+        with self._lock:
+            self._archived.add(file_id)
+            self._persist()
+
+    def is_archived(self, file_id: str) -> bool:
+        return file_id in self._archived

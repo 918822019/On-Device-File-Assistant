@@ -18,6 +18,7 @@ def env(tmp_path):
     src_dir.mkdir()
     cfg = PersonalFileConfig(
         store_path=str(tmp_path / "store.jsonl"),
+        state_path=str(tmp_path / "state.json"),
         source_dir=str(src_dir),
         faiss_index_path=str(tmp_path / "idx.index"),
         enable_faiss=False,
@@ -74,6 +75,7 @@ def test_run_once_import_skip_update_remove(env):
 def test_run_once_without_source_dir_noop(tmp_path):
     cfg = PersonalFileConfig(
         store_path=str(tmp_path / "store.jsonl"),
+        state_path=str(tmp_path / "state.json"),
         source_dir="",
         enable_faiss=False,
     )
@@ -91,6 +93,7 @@ def test_sweep_skipped_when_source_dir_missing(tmp_path):
 
     cfg = PersonalFileConfig(
         store_path=str(tmp_path / "store.jsonl"),
+        state_path=str(tmp_path / "state.json"),
         source_dir=str(tmp_path / "not_mounted"),
         enable_faiss=False,
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable
 from uuid import uuid4
 
@@ -47,7 +47,8 @@ _MERCHANT_PATTERNS = [
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    # utcnow() 在 3.12+ 已弃用；保持 naive UTC 输出格式与存量数据一致
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def _safe_float(value: str) -> float | None:

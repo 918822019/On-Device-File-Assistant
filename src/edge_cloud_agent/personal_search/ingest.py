@@ -186,7 +186,10 @@ def _build_item(service: PersonalFileSearchService, cfg: PersonalFileConfig, pat
         source_app=source_app,
         doc_type=doc_type,
         mime_type=mime_type,
-        raw_text=raw_text[:service.config.max_search_query_len] if raw_text else raw_text,
+        # 截断长度用独立配置：此前误复用 max_search_query_len（查询截断 120 字符），
+        # 文档正文可检索面被限死在开头一小段。已入库的旧记录在文件变更或
+        # 删除 store 重建后刷新。
+        raw_text=raw_text[: service.config.raw_text_max_chars] if raw_text else raw_text,
         summary=summary,
         file_path=path.as_posix(),
         captured_at=captured_at,

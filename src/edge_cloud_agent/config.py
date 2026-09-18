@@ -131,6 +131,8 @@ class PersonalFileConfig:
     """Knobs for personal file search and indexing."""
 
     store_path: str = os.getenv("FILE_MEMORY_STORE_PATH", "data/personal_file_store.jsonl")
+    # 备注/归档标记的持久化文件（此前仅内存，重启即丢）
+    state_path: str = os.getenv("FILE_MEMORY_STATE_PATH", "data/file_state.json")
     source_dir: str = os.getenv("FILE_MEMORY_SOURCE_DIR", "")
     scan_interval_seconds: int = _env_int("FILE_MEMORY_SCAN_INTERVAL_SECONDS", 120)
     scan_file_suffixes: str = os.getenv(
@@ -140,6 +142,9 @@ class PersonalFileConfig:
     scan_recursive: bool = _env_bool("FILE_MEMORY_SCAN_RECURSIVE", True)
     top_k_default: int = _env_int("FILE_MEMORY_TOP_K_DEFAULT", 8)
     max_search_query_len: int = _env_int("FILE_MEMORY_MAX_QUERY_LEN", 120)
+    # 入库文件内容的截断长度。此前误复用 max_search_query_len（120 字符，
+    # 那是"查询"的截断长度），导致文档正文只有开头一小段可被检索。
+    raw_text_max_chars: int = _env_int("FILE_MEMORY_RAW_TEXT_MAX_CHARS", 2000)
     enable_faiss: bool = _env_bool("FILE_MEMORY_ENABLE_FAISS", True)
     faiss_index_path: str = os.getenv(
         "FILE_MEMORY_FAISS_INDEX_PATH",

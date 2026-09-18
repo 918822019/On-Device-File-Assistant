@@ -43,6 +43,7 @@ def _make_item(
 def service(tmp_path) -> PersonalFileSearchService:
     cfg = PersonalFileConfig(
         store_path=str(tmp_path / "store.jsonl"),
+        state_path=str(tmp_path / "state.json"),
         faiss_index_path=str(tmp_path / "idx.index"),
         enable_faiss=False,
     )

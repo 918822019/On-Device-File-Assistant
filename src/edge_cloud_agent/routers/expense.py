@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from time import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -24,6 +25,25 @@ from ..expense.storage import ExpenseMaterial
 
 
 router = APIRouter()
+
+
+def _extraction_confidence(material: ExpenseMaterial) -> float:
+    """金额/日期/商户三个抽取字段的命中占比（0~1）。
+
+    旧实现 `1.0 if material.summary else 0.0` 恒为 1.0（summary 永不为空），
+    是假指标；现在反映真实抽取质量，也是复盘指标"字段纠正次数"的分母参照。
+    """
+
+    signals = (
+        material.extracted_amount is not None,
+        bool(material.extracted_date),
+        bool(material.merchant),
+    )
+    return round(sum(signals) / len(signals), 2)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 @router.post("/v1/expense/collect", response_model=ExpenseCollectResponse)
@@ -50,7 +70,7 @@ def collect(req: ExpenseCollectRequest, request: Request):
         extracted_date=material.extracted_date,
         merchant=material.merchant,
         summary=material.summary,
-        extraction_confidence=1.0 if material.summary else 0.0,
+        extraction_confidence=_extraction_confidence(material),
         needs_follow_up=bool(missing_types),
         missing_required_types=missing_types,
         claim_material_count=claim_count,
@@ -127,7 +147,8 @@ def export(req: ExpenseExportRequest, request: Request):
         claim_id=claim_id,
         material_count=len(materials),
         export_filename=f"expense_export_{claim_id or 'manual'}_{export_id}.txt",
-        export_time=materials[0].updated_at if materials else "",
+        # 旧值取 materials[0].updated_at（材料更新时间），与字段语义不符；改为真实导出时刻
+        export_time=_now_iso(),
         manifest=manifest,
         materials=[_build_export_material(material) for material in materials],
     )

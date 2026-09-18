@@ -9,17 +9,17 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from pathlib import Path
 from threading import RLock
-from time import perf_counter
+from time import monotonic, perf_counter
 from uuid import uuid4
 
 from ..config import PersonalFileConfig
 from ..embedding_runtime import EdgeEmbeddingRuntime
 from ..text_utils import tokenize as _tokenize
-from .storage import PersonalFileItem, PersonalFileStore
+from .storage import FileStateStore, PersonalFileItem, PersonalFileStore
 from .schemas import FileSearchCandidate
 from .vector_index import PersonalFileVectorIndex
 
@@ -44,12 +44,42 @@ _CLUE_COLOR_TOKENS = {
     "灰色": "gray",
 }
 
+# 来源提示的 key 与 _infer_source_from_path 的返回值域（wechat/email/gallery/camera）
+# 及 doc_type（document）对齐；此前用 image/office 作 key，与任何 source_app 值都
+# 对不上，只能靠 mime/doc_type 里的子串巧合命中。
 _SOURCE_KEYWORDS = {
     "wechat": {"微信", "weixin", "wechat", "微信好友", "微信群", "群里", "群聊"},
-    "email": {"邮箱", "email", "邮箱", "mail", "gmail", "outlook"},
-    "image": {"图库", "相册", "screenshot", "截图", "screen"},
-    "office": {"word", "excel", "ppt", "文件", "doc", "pdf"},
+    "email": {"邮箱", "email", "mail", "gmail", "outlook"},
+    "gallery": {"图库", "相册", "gallery"},
+    "camera": {"拍照", "相机", "camera", "截图", "screenshot", "screen"},
+    "document": {"word", "excel", "ppt", "文档", "文件", "doc", "pdf"},
 }
+
+# 来源提示 -> 候选文本中的字面别名。source_app / doc_type / mime 三处值域不同
+# （如"相册"提示=gallery，而图片文件 doc_type="image"、mime="image/*"），
+# 打分与过滤两侧共用本别名表，保证口径一致。
+_SOURCE_TEXT_ALIASES = {
+    "wechat": ("wechat",),
+    "email": ("email", "mail"),
+    "gallery": ("gallery", "image"),
+    "camera": ("camera", "screenshot"),
+    "document": ("document", "office", "pdf"),
+}
+
+# 版本标记：前面不是字母数字的 v+数字（方案v2 / V4 / v1.3），或中文"版本"。
+# 不用 \b：中文语境（如"方案v2"）里 CJK 与字母间没有词边界，\bv 命不中。
+_VERSION_MARK_RE = re.compile(r"(?<![a-z0-9])v\d+(?:\.\d+)*|版本")
+
+
+def _source_hit(source_hints: list[str], text_lower: str) -> list[str]:
+    """返回在候选文本中命中的来源提示列表（经别名展开）。"""
+
+    hits: list[str] = []
+    for hint in source_hints:
+        keys = _SOURCE_TEXT_ALIASES.get(hint, (hint,))
+        if any(key in text_lower for key in keys):
+            hits.append(hint)
+    return hits
 
 _LOGGER = logging.getLogger("agent_server.personal_search")
 
@@ -72,12 +102,25 @@ class _SearchSession:
     query: str
     candidates: list[_SearchCandidate]
     turn: int
+    last_access: float = 0.0
+
+
+# 会话治理：30 分钟未访问自动过期；容量上限 200，超出按最久未用淘汰。
+# 此前 _sessions 只进不出，长期运行内存只增不减。
+_SESSION_TTL_SECONDS = 30 * 60.0
+_SESSION_MAX_COUNT = 200
+
+
+def _utcnow_naive() -> datetime:
+    """naive UTC now。datetime.utcnow() 在 3.12+ 已弃用，统一走这里。"""
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _now_iso() -> str:
     """返回标准 UTC 时间字符串，统一日志和存储中的时间展示。"""
 
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return _utcnow_naive().isoformat(timespec="seconds")
 
 
 def _to_dt(value: str | None) -> datetime | None:
@@ -131,7 +174,7 @@ def _has_time_match(captured_at: str | None, query: str) -> tuple[bool, str]:
     if item_time is None:
         return False, ""
 
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     for pattern, days in TIME_PATTERNS:
         if pattern.search(q):
             if days == 1 and "今天" in q and abs((now.date() - item_time.date()).days) == 0:
@@ -195,8 +238,8 @@ class PersonalFileSearchService:
         self.embedding_runtime = embedding_runtime
         self._sessions: dict[str, _SearchSession] = {}
         self._session_lock = RLock()
-        self._annotations: dict[str, str] = {}
-        self._archived: set[str] = set()
+        # 备注/归档标记持久化（旧实现为内存 dict/set，重启即丢）
+        self._state_store = FileStateStore(config.state_path)
         self._vector_index = PersonalFileVectorIndex(config)
         # 初始化时记录向量索引可用性，便于启动期排障。
         _LOGGER.info(
@@ -282,7 +325,32 @@ class PersonalFileSearchService:
         return sorted(hints)
 
     def get_session(self, session_id: str) -> _SearchSession | None:
-        return self._sessions.get(session_id)
+        with self._session_lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session.last_access = monotonic()
+            return session
+
+    def _evict_sessions_locked(self) -> None:
+        """淘汰过期与超容会话（调用方须持有 _session_lock）。
+
+        惰性淘汰：在每次新建会话时执行——过期（TTL 内无访问）的直接删，
+        超容的按 last_access 最久未用删。
+        """
+
+        now = monotonic()
+        expired = [
+            sid
+            for sid, session in self._sessions.items()
+            if now - session.last_access > _SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            del self._sessions[sid]
+        overflow = len(self._sessions) - _SESSION_MAX_COUNT
+        if overflow > 0:
+            oldest = sorted(self._sessions.items(), key=lambda kv: kv[1].last_access)[:overflow]
+            for sid, _ in oldest:
+                del self._sessions[sid]
 
     def get_file(self, file_id: str) -> PersonalFileItem | None:
         return self.store.get(file_id)
@@ -316,7 +384,7 @@ class PersonalFileSearchService:
         )
 
     def add_annotation(self, file_id: str, note: str) -> bool:
-        """给指定文件补充/覆盖备注。
+        """给指定文件补充/覆盖备注（落盘持久化，重启不丢）。
 
         成功返回 True，目标文件不存在返回 False，并打 failed 日志。
         """
@@ -324,25 +392,25 @@ class PersonalFileSearchService:
         if not self.get_file(file_id):
             self._log_file_action("annotate", file_id, "failed", note_provided=bool(note))
             return False
-        self._annotations[file_id] = note.strip()
+        self._state_store.set_annotation(file_id, note.strip())
         self._log_file_action("annotate", file_id, "ok", note_size=len(note), note_preview=(note or "")[:40])
         return True
 
     def get_annotation(self, file_id: str) -> str | None:
-        return self._annotations.get(file_id)
+        return self._state_store.get_annotation(file_id)
 
     def archive_file(self, file_id: str) -> bool:
-        """标记文件为已归档，仅影响运行时展示与后续动作入口。"""
+        """标记文件为已归档（落盘持久化）。仅影响展示与动作入口，不改检索结果。"""
 
         if not self.get_file(file_id):
             self._log_file_action("archive", file_id, "failed")
             return False
-        self._archived.add(file_id)
+        self._state_store.set_archived(file_id)
         self._log_file_action("archive", file_id, "ok")
         return True
 
     def is_archived(self, file_id: str) -> bool:
-        return file_id in self._archived
+        return self._state_store.is_archived(file_id)
 
     def compare_payload(self, left_file_id: str, right_file_id: str) -> dict:
         """返回两个文件的对比建议，含推荐保留项和原因。"""
@@ -455,8 +523,10 @@ class PersonalFileSearchService:
             query=parsed_query,
             candidates=candidates,
             turn=0,
+            last_access=monotonic(),
         )
         with self._session_lock:
+            self._evict_sessions_locked()
             self._sessions[session.session_id] = session
 
         response_candidates = [self._to_schema(candidate) for candidate in candidates]
@@ -595,6 +665,7 @@ class PersonalFileSearchService:
         with self._session_lock:
             session.turn += 1
             session.candidates = candidates
+            session.last_access = monotonic()
             self._sessions[session_id] = session
         _LOGGER.info(
             "personal-search-clarify-completed",
@@ -957,9 +1028,9 @@ class PersonalFileSearchService:
             if time_hit:
                 filtered.append(candidate)
                 continue
-            # 与 _score_item 同口径：来源提示词出现在候选文本任意位置即算命中
-            # （如 "image" 提示可命中 doc_type="image"，不必局限 source_app）。
-            if source_hints and any(hint in text for hint in source_hints):
+            # 与 _score_item 同口径：来源提示经别名展开命中即保留
+            # （如"相册"提示=gallery，可命中 doc_type="image" 的图片文件）。
+            if _source_hit(source_hints, text):
                 filtered.append(candidate)
         return filtered
 
@@ -999,11 +1070,9 @@ class PersonalFileSearchService:
             matched.append("全文命中")
 
         clue_score = 0.0
-        for source in source_hints:
-            source_key = source
-            if source_key in haystack:
-                clue_score += 0.8
-                matched.append(f"来源:{source_key}")
+        for source in _source_hit(source_hints, haystack):
+            clue_score += 0.8
+            matched.append(f"来源:{source}")
 
         for visual in visual_hints:
             if visual in haystack:
@@ -1019,8 +1088,12 @@ class PersonalFileSearchService:
             clue_score += 0.5
             matched.append("版本关系")
 
+        # 仅当查询带版本意图（"最新/后来的/哪个版本"）且候选确实带版本标记
+        # （v2、v1.3、"版本"字样）时才给排序加分。
+        # 旧实现 `if "v" in haystack` 过松：任何含字母 v 的文本（video、save、
+        # csv、临时目录名）都拿 0.2 加分，与查询意图完全无关。
         version_rank_bonus = 0.0
-        if "v" in haystack:
+        if version_hint and _VERSION_MARK_RE.search(haystack):
             version_rank_bonus = 0.2
 
         embed_score = 0.0
