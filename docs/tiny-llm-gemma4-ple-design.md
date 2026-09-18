@@ -367,10 +367,11 @@ Vulkan/CUDA 留 stub。
 
 | 阶段 | 内容 | 产出 | 状态 |
 |---|---|---|---|
-| **0** | 读 transformers `Gemma4TextModel` 参考实现，钉死 `layer_scalar` 与 PLE 组合公式；写 `make_fake_gemma4_model.py` + `align_fake_gemma4_model.py` | 随机小模型上 C++ 与 HF logits 逐位置对齐（TOL=1e-5） | 参考规范 + 假模型已交付（`2b3bb26`）；**对齐脚本未做** |
+| **0** | 读 transformers `Gemma4TextModel` 参考实现，钉死 `layer_scalar` 与 PLE 组合公式；写 `make_fake_gemma4_model.py` + `align_fake_gemma4_model.py` | 随机小模型上 C++ 与 HF logits 逐位置对齐（TOL=1e-5） | 已交付（`2b3bb26` + `83f8ddf`）。对齐口径改为「argmax 零容差 + 相对误差 1e-4」，理由见下 |
 | **1** | V4Ext 头 + `ModelConfig` 字段 + `kGemma4` 枚举 + exporter `export_gemma4_to_tiny.py` | 能把真权重导出成 `.tqwen` 并通过 192B 头校验 | 已交付（`4b05317` `f5ea8e8` `c42787d`） |
 | **2+3+4** | 张量绑定 + 逐层 head_dim + KvCache 异构槽位 + KV 共享映射 | 假模型导出→加载→绑定全通过 | 已交付（`376dc84`）。**三个阶段合并做了**，理由见下 |
-| **2b** | gemma4 forward（decode + prefill）：PLE 三残差块、sliding 掩码、GEGLU、scaling=1.0、softcapping、layer_scalar | 假模型 logits 与 HF 对齐 | **未做**（当前由 fail-fast 守卫挡住） |
+| **2b** | gemma4 forward（decode + prefill）：PLE 三残差块、sliding 掩码、GEGLU、scaling=1.0、softcapping、layer_scalar | 假模型 logits 与 HF 对齐 | 已交付（`83f8ddf`）。逐 token prefill（与 decode 共用实现）；批量 GEMM prefill 未做 |
+| **0b** | `align_fake_gemma4_model.py` 数值对齐 | C++ ↔ HF 逐位置 logits + 逐阶段中间量 | 已交付（`83f8ddf`）。12/24 token 两组均通过，argmax 逐步一致 |
 | **5** | **PLE 流式**：`ExpertStore::read_bytes` 整行读 + 单行缓冲 | 常驻 RAM 从 ~2.6 GB 降到 ~1.3 GB | 未做（绑定已支持 `data==nullptr` + offset） |
 | **6** | i4 量化导出 + Android 交叉编译 + 目标机型实测 | 端侧可用 | 未做 |
 
@@ -385,6 +386,56 @@ Vulkan/CUDA 留 stub。
 **为什么阶段 0 必须最先做**：`layer_scalar` 和 PLE 公式猜错的后果是
 「能跑、不崩溃、输出垃圾」，与 R2 同类。先在随机小模型上对齐，
 是唯一能把这类错误变成显式失败的办法。
+
+---
+
+## 7. 对齐结果（tiny-llm `83f8ddf`）
+
+| 用例 | 位置数 | 最差相对误差 | argmax |
+|---|---|---|---|
+| 12 token prompt + 6 步 decode | 15 | 1.02e-5 | 逐步一致 |
+| 24 token prompt + 6 步 decode | 29 | 1.84e-5 | 逐步一致 |
+| 逐阶段对拍（位置 0） | 14 个阶段 | inputs_embeds **0.0e+00**、PLE 6 层 ~3e-7、层输出 ~1.5e-6 | — |
+
+24-token 那组覆盖 `sliding_window=8` 的截断，且误差在窗口边界**没有跳变**
+（pos 7 = 9.8e-7、pos 8 = 3.1e-6、pos 9 = 2.3e-6）—— 窗口写错的症状正是
+边界处突变，这条是专门看的。
+
+### 7.1 参考侧的坑：tied lm_head 覆盖 embed_tokens
+
+第一次对齐**位置 0 就偏 5.4e-1**。逐阶段对拍把它定位到 tag 1
+（inputs_embeds），即主嵌入这一步，与所有 gemma4 特有逻辑无关。
+
+根因在假模型生成器：`model.state_dict()` 会把 tied 参数在
+`model.embed_tokens.weight` 与 `lm_head.weight` 两个名字下都列出来，
+生成器于是填了**两份独立的随机数**。灌回模型时两键指向同一个 Parameter，
+后加载的 lm_head 覆盖前者 —— HF 的 `embed_tokens` 实际拿到 lm_head 的数值；
+而 exporter 导出的是 `model.embed_tokens.weight`，C++ tied 时 lm_head 复用
+embed，两边从第一个 token 就分叉。
+
+实证：C++ 的输出恰好等于 `state_dict['model.embed_tokens.weight'][7] * 8`
+（C++ 是对的），HF hook 抓到的是 `lm_head.weight[7] * 8`。
+真 checkpoint 也印证：`gemma-4-E2B-it` 的 safetensors 里**只有**
+`model.language_model.embed_tokens.weight`，没有 `lm_head.weight`。
+
+**方法论收获**：对齐失败时不要先怀疑被测实现。这次「参考实现」自己就是坏的，
+而生成器的自校验（missing=0 / unexpected=0 / logits 全有限）看不出来 ——
+它是自洽的，只是与导出的权重不是同一份。逐阶段对拍的价值正在于此：
+它把「谁错了」和「哪一步错了」一次问出来。现在生成器里加了硬断言：
+加载后 `embed_tokens.weight` 必须与 state_dict 逐元素相等、且与
+`lm_head.weight` 是同一份。
+
+### 7.2 对齐口径：为什么不是固定绝对容差
+
+C++ 与 HF 都是 fp32，差异只来自求和结合顺序（rmsnorm / attention 点积用
+double 累加，torch 用分块归约），随位置数**线性累积**：
+pos 0 = 3.6e-7、pos 8 = 4.1e-6、pos 27 = 1.37e-5。原计划的固定
+`TOL=1e-5` 在 24-token 那组第一次就误报了。
+
+改为两条门槛：① **argmax 逐位置完全一致**（硬门槛，零容差）—— greedy
+decode 的可见行为只由它决定；② **相对误差 < 1e-4**，相对该位置 logits
+自身动态范围 (max−min)。放宽到 1e-4 仍然有效：结构性错误的实测量级在
+1e-1 ~ 1e0（本次 tied bug 5.4e-1、绑定错 7.6e-1），高出三到四个数量级。
 
 **为什么 PLE 流式排在阶段 5 而不是更早**：它依赖阶段 2 的正确 forward，
 且本身改动量小（有先例）。先让模型算对，再优化内存。
