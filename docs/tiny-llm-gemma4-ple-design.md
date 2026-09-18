@@ -429,6 +429,42 @@ embed，两边从第一个 token 就分叉。
 加载后 `embed_tokens.weight` 必须与 state_dict 逐元素相等、且与
 `lm_head.weight` 是同一份。
 
+### 7.3 阶段 6d（i4 量化）的落地设计 —— 已勘察，未实现
+
+真模型 f16 常驻 4348 MB，手机端放不下，i4 是必须的（目标 ~1.8 GB）。
+本节记录已经**查证过的事实**，避免下次重新摸索。
+
+**格式侧已就绪**，无需新增：
+- `Dtype::kI4` 已存在（HQQ 风格 interleaved），组布局
+  `[scale_fp16(2B) | zero_fp16(2B) | packed(group_size/2 B)]`，
+  `i4_row_bytes(in_dim, gs) = ceil(in_dim/gs) × (4 + gs/2)`
+  （`tools/export_qwen_to_tiny_i4.py:68-128`，917 行里有现成的量化器
+  `pack_i4_groups`，可直接复用）。
+- loader 对 kI4 文件的 dtype 约束是「**只允许 kI4 或 kF32**」
+  （`model_loader.cpp:439-447`）——注意**不含 f16**，所以 gemma4 的 i4 导出
+  不能沿用 f16 那套逐张量 dtype 分配，小向量必须落 f32。
+- V4Ext 里的 `ple_row_bytes` 是**导出期算好写盘**的，运行期不重算。
+  这个当初的决定在 i4 下正好是必需的：PLE 行字节数在 f16 是
+  8960×2 = 17920，在 i4/gs=64 是 140×(4+32) = **5040**（4.5 bpw），
+  两者差 3.56 倍。本仓有过硬编码 `sizeof(float)` 导致 fp16 embed 读错偏移、
+  CosSim 掉到 0.87 且 argmax 全错却**不崩溃**的事故（reference-spec R2），
+  i4 的 in-band 分组布局会让同类错误更容易发生。
+
+**还需要做的四件事**：
+
+| # | 内容 | 关键点 |
+|---|---|---|
+| 1 | exporter 的 gemma4 i4 分支 | 逐张量分派 dtype：matmul 权重（q/k/v/o_proj、gate/up/down、ple_gate/ple_proj、per_layer_model_projection）→ kI4；norm 与 layer_scalar → kF32；**embed_tokens 与 PLE 表都是查表**，需要 i4 的**行反量化**而不是 matvec，可量化但运行期路径不同 |
+| 2 | gemma4 前向的 i4 行反量化 | 当前 `qwen_forward_gemma4.cpp:194` 对非 f32/f16 的 embed dtype **显式 abort**（不是静默走错）。需要补 `dequant_i4_row`（Qwen 路径已有同名函数可参照）以及 PLE 表的 i4 行反量化 —— 后者是**新代码**，因为 PLE 的 in_dim 是 8960 而非 hidden |
+| 3 | matmul 的 group_size 传参 | `mv_typed(..., group_size_)` 目前传的是模型级 `cfg.quant_group_size`；i4 文件下需确认该字段由 V4/V2 ext 正确填充，否则会按错误分组解析（症状同样是「能跑的乱码」） |
+| 4 | **验收口径必须换** | i4 下 logits 不可能与 fp32 HF 落在 1e-4 内，§7.2 的相对误差门槛直接失效。需要另立判据，建议：① 长序列（≥256 token）greedy **token 一致率**；② 同一批语料的 **PPL 退化幅度**（C++ 侧已有 `--ppl` / `forward_ppl`）；③ 与 f16 导出结果对照，而不是只与 HF fp32 对照。这三条的阈值需要先跑一次拿到量级再定，不能凭空写 |
+
+**PLE 表 i4 的收益要分清**：它省的是**磁盘**（4.70 GB → 1.68 GB）和
+每 token 的 pread 字节（17920 → 5040），**不省常驻内存** —— PLE 本来就
+留盘（§5.1 实测留盘不但不慢反而略快）。省常驻的是那 1.877B 的
+「非 embed、非 PLE」权重（f16 3.75 GB → i4 ~1.0 GB）。
+所以如果时间有限，**优先量化第 1 类权重，PLE 表可以最后做甚至不做**。
+
 ### 7.2 对齐口径：为什么不是固定绝对容差
 
 C++ 与 HF 都是 fp32，差异只来自求和结合顺序（rmsnorm / attention 点积用
