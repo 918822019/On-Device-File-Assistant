@@ -34,7 +34,7 @@
 | 1 | i4 W4A8 Vulkan kernel(quantize + matvec)+ host 封装 + 逐位对拍 harness(`tests/test_vulkan_i4.cpp`,9 档 gemma4 真实形状 + 残组;止损点 B 计时探针) | GPU vs CPU sdot6 fp32 逐位一致 | 代码就绪(1b70b2b + arena 化 9c1eb41),双端编译绿;**待真机 parity** |
 | 2 | Gemma4VulkanEngine 骨架 v0(CPU 编排逐语句复制 forward + GPU i4 matvec)+ `--gemma4-vk` CLI 接线 + rmsnorm/rope bitwise shader(已写未接线) | v0 端到端 generated_ids 逐位 = CPU golden | 代码就绪(9c1eb41, 2d0157b);**待真机** |
 | 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | **前置已落地**(4227fad):portable math CPU/GPU 同源(tq_expf/tq_expm1f/tq_tanhf)+ attention/geglu/math_probe 三个 shader 已写(probe API 就绪,引擎未接线);**待真机对拍**(R2 收窄为 Adreno precise 合规性) |
-| 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | 未开始 |
+| 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | **lm_head shader 已就绪**(5515b5d:gemma4_matvec_f16.comp 逐位复刻 neon_mt_kv_nt + parity/拒绝/计时探针三用例);引擎接线与 PLE 上传待真机 |
 | 5 | main.cpp 正式集成(`--backend vulkan` 对 gemma4-i4 分支到执行器、内存预检计入 GPU 副本、verify_android.sh BACKEND 参数化) | host CTest + 真机 tests 全绿 + CPU 回归 | 最小接线已提前落地(--gemma4-vk);正式 gate 改造未开始 |
 | 6 | bench_gemma4_vulkan.sh(CPU vs GPU 配对、热门禁、RSS/温度)+ optimization_log/android.md/本文档回填 | bench 内嵌逐位比对 | 未开始 |
 
@@ -59,6 +59,7 @@
 - `runtime/vulkan/gemma4_{quant_x_i4,matvec_i4,rmsnorm,rope}.comp` — 已交付的 4 个 shader
 - `kernels/math/portable_math.{h,cpp}` + `runtime/vulkan/portable_math.comp.inc` — tq_expf/tq_expm1f/tq_tanhf,CPU/GLSL 同源逐语句对应(-ffp-contract=off ↔ precise)
 - `runtime/vulkan/gemma4_{math_probe,geglu,attention}.comp` — Phase 3 前置 shader(对拍探针 / geglu·gelu_tanh 双模式 / 每 head 串行 online softmax)
+- `runtime/vulkan/gemma4_matvec_f16.comp` — lm_head f16 matvec(Phase 4 前置,4 链×mod-32 归约复刻;in_dim%32 gate)
 - `runtime/gemma4_vk_kernels.{h,cpp}` + stub — i4 内核 host 封装(arena 寻址,repack 共用)
 - `runtime/gemma4_vulkan.{h,cpp}` + stub — 引擎(v0 混合形态)
 - `tests/test_vulkan_i4.cpp` — 逐位对拍 + 计时探针(仅 TINYQWEN_HAS_VULKAN 注册;含 math/geglu/attention 三个真机 parity 用例)
