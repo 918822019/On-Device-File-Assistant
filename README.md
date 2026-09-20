@@ -199,5 +199,7 @@ JSONL 存储往返与容错、增量扫描生命周期（导入/跳过/变更重
 | [docs/edge-model-budget.md](docs/edge-model-budget.md) | 端侧模型体积预算测算 |
 | [docs/gemma4-reference-spec.md](docs/gemma4-reference-spec.md) | gemma4 文本前向逐算子参考规范 |
 | [docs/tiny-llm-gemma4-ple-design.md](docs/tiny-llm-gemma4-ple-design.md) | tiny-llm 支持 gemma4 + PLE 流式加载的设计 |
+| [docs/gemma4-vulkan-plan.md](docs/gemma4-vulkan-plan.md) | gemma4 i4 上 Android Vulkan GPU 的立项计划、逐位门禁与止损点 |
+| [docs/gemma4-cpu-op-bitwise-inventory.md](docs/gemma4-cpu-op-bitwise-inventory.md) | gemma4 CPU 算子逐位算术清单(Vulkan 复现依据,反汇编核实) |
 | [docs/edge-runtime-data-layout.md](docs/edge-runtime-data-layout.md) | 端侧运行时数据目录布局 |
 | [android/README.md](android/README.md) | Android MVP 客户端说明 |

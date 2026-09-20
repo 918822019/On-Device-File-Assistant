@@ -1,0 +1,64 @@
+# gemma4-E2B i4 × Android Vulkan GPU 推理 —— 立项计划与状态
+
+> 状态快照:2026-09-20。工作全部在 `third_party/tiny-llm`(分支 feat/gemma4-ple),
+> 每阶段一组 commit + 数据回填其 `docs/optimization_log.md`。
+> 逐位复现的算术依据:[gemma4-cpu-op-bitwise-inventory.md](gemma4-cpu-op-bitwise-inventory.md)。
+
+## 已确认的范围决策
+
+| 项 | 决策 |
+|---|---|
+| 载体 | CLI(adb push tinyqwen),不做 App/JNI 集成(另立项) |
+| 真机 | OnePlus PLK110 / Android 16 / Adreno 840 / 16GB 统一内存 |
+| 验收 | **先正确后性能**:每阶段 GPU generated_ids / slot dump 与 CPU golden 逐位一致;性能只记录,最终给完整对比表 |
+| 模型 | 主 `gemma4-qat-q4_0-plei4.tqwen`(QAT 对称 i4 + PLE i4),副 `gemma4-e2b-i4.tqwen`(RTN 非对称,GPU v1 不支持,仅 CPU golden) |
+| 技术路线 | **整段 forward 执行器**(仿 DFlashVulkanEngine,每 token 一次 submit);不走逐算子 backend_vulkan 扩展(实测负收益 2.2×,gemma4 35 层会放大到 400+ 次同步/token) |
+| CPU/GPU 分工 | GPU:全部 i4 matvec + 逐层算子;CPU:prefill(数值锚点)、PLE 查表(--ple-ssd,每 token pread ~5.6KB + 上传 35.8KB)、softcapping/argmax(v1 回读 1MB logits) |
+| golden 口径 | **真机 CPU i4(QAT+sdot6+neon ops)**,不是 f16(f16 与 i4 本有 2.25% 分叉,混用不可归因);ref 系算子是 double 累加,与 neon 逐位不同,一律采 neon 路径 |
+
+## 关键设计决策
+
+- **i4 GPU 布局**:不改文件格式、不加导出变体;init 时 host 重排(in-band 68B/组 → packed nibble 连续块 + fp16 位模式 scales 数组),`gemma4_vk_repack_i4` 为引擎/harness 共用实现
+- **i4 kernel 算术**:逐位复刻 sdot6 的 W4A8(激活分组 amax→int8 对称量化;组内 int32 点积精确、顺序无关、subgroup 并行;跨组 fp32 **g 升序顺序累加**,每 lane 冗余同序;GLSL `precise` 防 contraction;手写 round-half-away-from-zero)
+- **PLE**:保持 --ple-ssd 留盘 + 每 token 上传 [35,256] fp32(~10µs);PLE 表一字节不上 GPU。内存预算峰值 ~4.0–4.4GB / 16GB ✅
+- **KV**:GPU 双池 + 跨层共享按 kv_cache 的 slot_map 拓扑;sliding 池环形(window 512,回绕语义与 CPU 一致)、full 池线性;head_dim 256/512 用 specialization 区分
+- **prefill v1 留 CPU**(锚点 + initialize_from_cpu 导入 KV);GPU batched prefill 列计划外
+- **rope**:cos/sin 表 host 每 token 用与 CPU 内核同一份 powf/sincosf 生成后上传(GPU 零超越函数);sliding=分离形、full=编译态融合形(清单 §2/§3,⚠️ NDK 产物须重新反汇编核对)
+- **expf/tanhf**(attention/geglu 需要):Android bionic 与 ARM optimized-routines 同源,移植其多项式进 shader;不可逐位时触发降级检查点(提请拍板,不静默降级)
+
+## 阶段与状态
+
+| Phase | 内容 | 门禁 | 状态 |
+|---|---|---|---|
+| 0 | CPU i4 真机基线 + golden 采集(`scripts/collect_gemma4_golden.sh`:2 模型 × 3 prompt × {16,64} tok × 2 运行,含逐层 g4_dump、热门禁、meminfo) | golden 两次运行逐位可复现 | 脚本就绪(2b79b83),宿主机配方已验证;**待真机** |
+| 1 | i4 W4A8 Vulkan kernel(quantize + matvec)+ host 封装 + 逐位对拍 harness(`tests/test_vulkan_i4.cpp`,9 档 gemma4 真实形状 + 残组;止损点 B 计时探针) | GPU vs CPU sdot6 fp32 逐位一致 | 代码就绪(1b70b2b + arena 化 9c1eb41),双端编译绿;**待真机 parity** |
+| 2 | Gemma4VulkanEngine 骨架 v0(CPU 编排逐语句复制 forward + GPU i4 matvec)+ `--gemma4-vk` CLI 接线 + rmsnorm/rope bitwise shader(已写未接线) | v0 端到端 generated_ids 逐位 = CPU golden | 代码就绪(9c1eb41, 2d0157b);**待真机** |
+| 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | 未开始(attention 需 bionic expf 移植,最难,R2) |
+| 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | 未开始 |
+| 5 | main.cpp 正式集成(`--backend vulkan` 对 gemma4-i4 分支到执行器、内存预检计入 GPU 副本、verify_android.sh BACKEND 参数化) | host CTest + 真机 tests 全绿 + CPU 回归 | 最小接线已提前落地(--gemma4-vk);正式 gate 改造未开始 |
+| 6 | bench_gemma4_vulkan.sh(CPU vs GPU 配对、热门禁、RSS/温度)+ optimization_log/android.md/本文档回填 | bench 内嵌逐位比对 | 未开始 |
+
+## 风险与止损点
+
+| # | 风险 | 探测时点 | 处置 |
+|---|---|---|---|
+| R1 | 带宽无优势(统一内存共享 LPDDR5X,decode 带宽 bound) | Phase 1 计时探针 | **止损点 B**:lm_head/down_proj 单 kernel GPU > CPU sdot6 且全层外推无优势 → 终止,数据回填 |
+| R2 | bitwise 不可达(expf/tanhf/归约穷尽移植仍分叉) | Phase 3 | **止损点 A**:分歧不可收敛 → 提请降级(逐层 ULP 级 + generated_ids 逐位 + margin 监控);不接受则终止回退 CPU i4 |
+| R3 | 单 buffer/分配上限 | Phase 2 | 按层分片 VkBuffer |
+| R4 | GPU 持续降频 | Phase 6 | 报告冷热两态 |
+| R5 | KV 共享拓扑复杂度超估 | Phase 2 | v1 收缩:仅 QAT 对称 + 固定 ctx + --ple-ssd(已在 create() gate 落地) |
+| R6 | 激活量化舍入不一致 | Phase 1 | harness 先单独对拍 quantize(int8 逐位)再对拍整 matvec(已落地) |
+| R7 | NDK contraction 与 Apple clang 不同 | Phase 0/3 | golden 采真机 NDK 产物;清单 §0.5 要求重新反汇编核对 |
+
+**总体止损**:R1/R2 触发且不接受降级 → 结论「GPU 路线不成立」,CPU i4(--ple-ssd + sdot6_mt)维持部署推荐;已完成 kernel/harness 作 experimental 保留,负结果回填 optimization_log。
+
+**预期管理**:Adreno 840 无独立显存,decode 每 token 读 ~1.9GB 权重打同一条 LPDDR5X;GPU 收益来源是带宽利用率与并行 + 释放 CPU,合理目标 **1.0–1.6× vs CPU i4**,不是数倍加速。
+
+## 文件地图(tiny-llm 侧)
+
+- `runtime/vulkan/gemma4_{quant_x_i4,matvec_i4,rmsnorm,rope}.comp` — 已交付的 4 个 shader
+- `runtime/gemma4_vk_kernels.{h,cpp}` + stub — i4 内核 host 封装(arena 寻址,repack 共用)
+- `runtime/gemma4_vulkan.{h,cpp}` + stub — 引擎(v0 混合形态)
+- `tests/test_vulkan_i4.cpp` — 逐位对拍 + 计时探针(仅 TINYQWEN_HAS_VULKAN 注册)
+- `scripts/collect_gemma4_golden.sh` — Phase 0 采集
+- `runtime/main.cpp` — `--gemma4-vk` 最小接线
