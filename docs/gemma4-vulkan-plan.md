@@ -31,7 +31,7 @@
 | Phase | 内容 | 门禁 | 状态 |
 |---|---|---|---|
 | 0 | CPU i4 真机基线 + golden 采集(`scripts/collect_gemma4_golden.sh`:2 模型 × 3 prompt × {16,64} tok × 2 运行,含逐层 g4_dump、热门禁、meminfo) | golden 两次运行逐位可复现 | 脚本就绪(2b79b83),宿主机配方已验证;**待真机** |
-| 1 | i4 W4A8 Vulkan kernel(quantize + matvec)+ host 封装 + 逐位对拍 harness(`tests/test_vulkan_i4.cpp`,9 档 gemma4 真实形状 + 残组;止损点 B 计时探针) | GPU vs CPU sdot6 fp32 逐位一致 | 代码就绪(1b70b2b + arena 化 9c1eb41),双端编译绿;**待真机 parity** |
+| 1 | i4 W4A8 Vulkan kernel(quantize + matvec)+ host 封装 + 逐位对拍 harness(`tests/test_vulkan_i4.cpp`,9 档 gemma4 真实形状 + 残组;止损点 B 计时探针) | GPU vs CPU sdot6 fp32 逐位一致 | 真机首跑 6 失败已全部归因(3 harness bug:probe 相对偏移/arena 扩容清零/测试循环反向——均已修;2 驱动偏差 H1/H2——exact_arith 已落地;1 FTZ——tq_ftz 双侧对齐);止损点 B 数据已采(lm_head GPU 外推 22.7ms vs CPU 164.6ms ≈ **7.2×**;down_proj GPU 1.80ms vs sdot6 0.90ms/mt 3.57ms 且 mt p95 过热);**待重推真机复跑** |
 | 2 | Gemma4VulkanEngine 骨架 v0(CPU 编排逐语句复制 forward + GPU i4 matvec)+ `--gemma4-vk` CLI 接线 + rmsnorm/rope bitwise shader(已写未接线) | v0 端到端 generated_ids 逐位 = CPU golden | 代码就绪(9c1eb41, 2d0157b);**待真机** |
 | 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | **前置已落地**(4227fad):portable math CPU/GPU 同源(tq_expf/tq_expm1f/tq_tanhf)+ attention/geglu/math_probe 三个 shader 已写(probe API 就绪,引擎未接线);**待真机对拍**(R2 收窄为 Adreno precise 合规性) |
 | 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | **lm_head shader 已就绪**(5515b5d:gemma4_matvec_f16.comp 逐位复刻 neon_mt_kv_nt + parity/拒绝/计时探针三用例);引擎接线与 PLE 上传待真机 |
@@ -43,7 +43,7 @@
 | # | 风险 | 探测时点 | 处置 |
 |---|---|---|---|
 | R1 | 带宽无优势(统一内存共享 LPDDR5X,decode 带宽 bound) | Phase 1 计时探针 | **止损点 B**:lm_head/down_proj 单 kernel GPU > CPU sdot6 且全层外推无优势 → 终止,数据回填 |
-| R2 | bitwise 不可达(expf/tanhf/归约穷尽移植仍分叉) | Phase 3 | **已大幅收窄**(4227fad):expf/tanhf 改为 CPU/GPU 同源 vendored 多项式(逐位一致由构造保证,不依赖平台 libm);剩余 = Adreno 对 GLSL `precise` 的合规性(除法不得 reciprocal 近似、不得 contraction)——math_probe 定向阈值位 + 16 万随机点对拍验证。若仍分叉 → **止损点 A**:提请降级(逐层 ULP 级 + generated_ids 逐位 + margin 监控);不接受则终止回退 CPU i4 |
+| R2 | bitwise 不可达(expf/tanhf/归约穷尽移植仍分叉) | Phase 3 | **已判定并消解**(真机实测):Adreno 840 对 ExtInst Fma(H1,拆成 mul+add)与 FDiv(H2,rcp+mul)**不合规**,其余原语(mul/add/sub/floor/ceil/int/unpackHalf2x16/subgroupAdd)合规;FTZ 于 subnormal。对策 = `exact_arith.comp.inc`(fma_exact/div_exact,只用合规原语构造 correctly-rounded FMA/除法),全部 shader 已替换,离线 489 万+ 样本 vs Fraction 黄金基准 0 失配;FTZ 双侧显式 tq_ftz 对齐。bitwise 由构造恢复,**止损点 A 不再需要**;待真机重跑 parity 最终确认(见清单 §10.1) |
 | R3 | 单 buffer/分配上限 | Phase 2 | 按层分片 VkBuffer |
 | R4 | GPU 持续降频 | Phase 6 | 报告冷热两态 |
 | R5 | KV 共享拓扑复杂度超估 | Phase 2 | v1 收缩:仅 QAT 对称 + 固定 ctx + --ple-ssd(已在 create() gate 落地) |

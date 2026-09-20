@@ -276,6 +276,28 @@
 | PLE 合并(L310) | **容易** | 注意是 `fma(tok,ts,ctx)*merge`,非源码文本的两次舍入 |
 | (对照)rmsnorm_ref / attention_ref / matvec_f16_ref | **需 fp64 或降级** | double 顺序累加;GLSL 无 fp64 时需 double-float 模拟(代价高)或放弃对 ref golden 的逐位、改对 neon golden |
 
+### 10.1 真机判定(2026-09,PLK110/Adreno 840):precise 合规性实测 → exact_arith 对策
+
+R2 的最后一块("Adreno 对 GLSL precise 的合规性")已真机判定,**两项不合规、其余合规**:
+
+| 原语 | Adreno 840 实测 | 判定方式 |
+|---|---|---|
+| FMul/FAdd/FSub(precise) | **合规**:correctly-rounded、不融合 | quantize int8 全 48 组 q 值 100% 逐位一致 |
+| Floor/Ceil/int() 截断/比较/选择 | **合规** | 同上 |
+| unpackHalf2x16 | **合规**(精确) | matvec_f16 权重位对拍 |
+| subgroupAdd(int) | **合规** | quantize 整数归约 |
+| ExtInst GLSLstd450 **Fma** | **不合规(H1)**:降级成分离 mul+add(双舍入) | numpy 逐位重放 GPU 输出 = mul+add 形态命中 |
+| **FDiv** | **不合规(H2)**:降级成 rcp+mul,非 correctly-rounded | quantize sx 4/48 组分歧 + expm1@28 重放,rcp 变体逐位吻合 |
+| subnormal | 算术结果/操作数 **FTZ** | exp 下溢区 gpu=0 |
+
+SPIR-V 层(glslc -O)本身忠实:opcode dump 证实真 FDiv/Fma 存在、无倒数常量替换——偏差发生在驱动 JIT。
+
+**对策(已落地)**:`runtime/vulkan/exact_arith.comp.inc` —— `fma_exact`(Dekker split12 误差分离 + 三层 Knuth TwoSum + Sterbenz 精确 half-ulp 比较 + 显式 tie-to-even)与 `div_exact`(双 Newton-Raphson + Markstein 终步,种子取 native 1/b,对 ≤2ulp 扰动收敛——覆盖 rcp 种子误差),**只由合规原语构成**,因此在 Adreno 与合规驱动(MoltenVK/桌面)上同为 correctly-rounded。全部 gemma4 shader 的 fma() 与浮点 `/` 已替换;离线验证:fma_exact 对 9 万+ 随机/显式 tie/近消去/Dekker 边界样本、div_exact 对 480 万随机+对抗+种子扰动样本,与纯 Fraction 黄金基准 0 失配(注意:`math.fma` 经 float64 双舍入,**不可**用作 f32 FMA 的黄金基准——tie 点会给错答案,本轮实测踩坑并复核)。
+
+**FTZ 契约(双侧显式,与驱动无关)**:`tq_ftz` 同时进 CPU(portable_math.cpp)与 GLSL——tq_expf 缩放返回路径输出 flush;tq_expm1f/tq_tanhf 入口 flush(两者微小输入 pass-through 会原样传出 subnormal)。引擎契约内(expm1 输入 |x|≥2^-11)不受影响,只对齐探针/边角。fma_exact/div_exact 契约:非零操作数 |·|∈[2^-48,2^48]、商 |a/b|∈[2^-47,2^47]、结果 |T|≥2^-96;域外回退 native(吸收区无害,论证见文件头注释)。
+
+**CPU 侧配套**:matvec_i4_sdot6 三处 `acc += A*dot` 钉死 `std::fmaf`(默认 contraction 下本就是 fmla,显式化使 golden 语义不依赖编译选项);GPU 对应 fma_exact。
+
 ### 落地建议
 1. **golden 一律用 `--ops-impl neon --matvec-impl sdot6_mt` 的实机产物采集**(本文所有「编译实际」都以此为准);ref 路径含 double 累加,不建议作为 GPU 逐位目标。
 2. expf/tanhf 两条路线:(a) 从 opensource.apple.com 的 libm 抠 expf/tanhf 多项式移植进 shader;(b) **推荐**:在 tiny-llm 里把 `std::exp/std::tanhf` 替换为内嵌的可移植实现,重采 golden——shader 与 CPU 共享同一份多项式源码,一劳永逸且跨平台(Android NDK 的 libm 与 Apple 不同,路线 (a) 换平台即失效)。
