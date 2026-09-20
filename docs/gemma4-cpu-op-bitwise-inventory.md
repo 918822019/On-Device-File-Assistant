@@ -9,6 +9,7 @@
 1. **编译器 contraction 是开启的**(clang 默认 `-ffp-contract=fast/on`)。反汇编证实:凡是源码里写成标量表达式 `a*b+c` 的地方(ref 系 kernel、forward 里的 PLE 合并),二进制里都是 `fmadd/fmla`(单次舍入);而 **NEON intrinsic 路径(vmulq/vfmaq/vsubq)不会被再融合**,保持指令级语义。
    ⇒ 「逐位复现」的目标必须是**编译产物的行为**,不是源码文本的行为。两者在 ref 系 kernel 上不一致。
 2. 超越函数全部来自 **Apple libm**:`powf`、`___sincosf_stret`(sin/cos 成对融合调用,不是独立 sinf/cosf!)、`expf`、`tanhf`。`sqrt`/除法用 IEEE 正确舍入指令 `fsqrt`/`fdiv`(与 GPU 一致)。**没有任何 rsqrt 近似/牛顿迭代**。
+   ⚠️ **2026-09-20 更新(tiny-llm 4227fad)**:gemma4 golden 路径的 `expf`/`tanhf` 已替换为 vendored 的 `tq_expf/tq_expm1f/tq_tanhf`(kernels/math/portable_math.*,与 GLSL 转录同源,见 §10 路线 b 落地记录);本条的 Apple libm 描述适用于替换前的产物,`powf/sincosf`(rope 表,host 数据)仍走平台 libm。contraction 依赖点(gemma4 golden 路径)已全部钉死为显式 `std::fmaf`:attention l 更新、geglu/gelu inner、PLE 合并、proportional_rope——§3/§4/§5 的「编译实际」形态现在是**源码显式保证**,不再依赖编译器行为(R7 在这些点消解)。
 3. `vaddvq_f32` 的 lowering 已从反汇编确认为 `faddp.4s v,v,v` + `faddp.2s` = **`((l0+l1)+(l2+l3))`**(成对树形,不是顺序)。
 4. gemma4 全部维度:hidden=1536、head_dim=256(sliding)/512(full)、ple_dim=256、inter=6144/12288、lm_head in_dim=1536。**全是 16 的倍数** ⇒ rmsnorm_neon / attention dot_neon / rope_neon 主循环、matvec_f16 的 32 元素主循环都**恰好整除,所有标量尾段在 gemma4 上永不执行**(尾段里存在与主循环不同语义的 fmadd,可整体忽略)。
 5. 若 golden 换平台(Android NDK / Linux)重采:libm 与 contraction 默认值都会变,本清单需按新产物重新反汇编核对。
@@ -140,7 +141,7 @@
 - (g) **GLSL:最难的一个**。
   - dot:容易(复现 4×vec4 FMA 跨步 + merge + `((l0+l1)+(l2+l3))`)。
   - online softmax 对 t **本质顺序**(每步 rescale 依赖上一步的 m/l/oh)⇒ GPU 必须每 head 一个线程(或 workgroup)沿 t 串行循环复现,不能改成并行两遍 softmax(那样舍入路径完全不同)。
-  - `expf`:必须**移植 Apple libm expf 的多项式**逐位一致(或见 §10 建议:CPU 侧换成可移植 expf 后重采 golden)。
+  - `expf`:~~必须移植 Apple libm expf~~ **已落地 §10 路线 b**:CPU 与 shader 同源 `tq_expf`(4227fad),golden 在替换后采集。shader 见 runtime/vulkan/gemma4_attention.comp(每 q-head 一 invocation,沿 t 串行)。
   - f16kv 变体(L182-273)gemma4 不用(forward L167-172 显式 abort `--kv-f16`)。
 
 ---
@@ -266,7 +267,7 @@
 | rmsnorm(rmsnorm_neon) | **容易(需复现归约结构)** | 4×vec4 FMA + `((s0+s1)+(s2+s3))` + `((l0+l1)+(l2+l3))`;sqrt/div IEEE;无尾段 |
 | rope(rope_neon,sliding 层) | **容易 + host 表** | 非融合 mul/mul/sub;cos/sin 表由 host 用同版 powf/sincosf 预计算上传 |
 | proportional_rope(ref,full 层) | **容易 + host 表(但形态不同!)** | 必须按编译态融合形:`fma(x0,c,-fl(x1*s))` / `fma(x1,c,fl(x0*s))` |
-| attention_decode(neon) | **需移植多项式 + 需复现归约结构** | dot 4 链 FMA 可复现;online softmax 必须沿 t 串行(每 head 一线程);**expf 必须逐位**(移植 Apple libm expf,或 CPU 换可移植 expf 重采 golden——推荐后者) |
+| attention_decode(neon) | **shader 已写,待真机对拍** | dot 4 链 FMA + online softmax 沿 t 串行(每 head 一 invocation)已按本节结构复刻进 gemma4_attention.comp;expf = 同源 tq_expf(4227fad);l 更新已钉 fmaf。剩余风险 = Adreno 的 precise 除法/截断合规性(math_probe + attention parity 验证) |
 | geglu / gelu_tanh(ref) | **需移植多项式** | `tanhf` 逐位;inner 必须 `fma(C,(v*v)*v,v)`;乘法顺序不可重排(源码自证 6e-3 风险) |
 | softcapping(forward L547) | **需移植多项式** | 同 tanhf |
 | matvec_f16(neon_mt_kv_nt,lm_head) | **容易~中等(需复现归约结构)** | 4 链×每轮 2 FMA、跨步 mod 32、`(0+1)+(2+3)`+成对横加;fp16→fp32 精确;MT 行独立不影响逐位 |
@@ -277,7 +278,11 @@
 
 ### 落地建议
 1. **golden 一律用 `--ops-impl neon --matvec-impl sdot6_mt` 的实机产物采集**(本文所有「编译实际」都以此为准);ref 路径含 double 累加,不建议作为 GPU 逐位目标。
-2. expf/tanhf 两条路线:(a) 从 opensource.apple.com 的 libm 抠 expf/tanhf 多项式移植进 shader;(b) **推荐**:在 tiny-llm 里把 `std::exp/std::tanhf` 替换为内嵌的可移植实现(如 ARM optimized-routines 的 expf/tanhf,NDK bionic 同源),重采 golden——shader 与 CPU 共享同一份多项式源码,一劳永逸且跨平台(Android NDK 的 libm 与 Apple 不同,路线 (a) 换平台即失效)。
+2. expf/tanhf 两条路线:(a) 从 opensource.apple.com 的 libm 抠 expf/tanhf 多项式移植进 shader;(b) **推荐**:在 tiny-llm 里把 `std::exp/std::tanhf` 替换为内嵌的可移植实现,重采 golden——shader 与 CPU 共享同一份多项式源码,一劳永逸且跨平台(Android NDK 的 libm 与 Apple 不同,路线 (a) 换平台即失效)。
+   **路线 (b) 已落地(4227fad,golden 采集之前 = 零重采成本)**,并修正两个原文判断:
+   - bionic `expf` = ARM optimized-routines(bionic Android.bp:33 链 `libarm-optimized-routines-math`)——但 OR expf 内部走 **double** 路径(z/r/y 全是 double),移动 GPU 无 `shaderFloat64`,**无法照抄进 GLSL**;
+   - bionic `tanhf` = FreeBSD `s_tanhf.c`(OR 没有标量 tanhf),内部调 `expm1f`。
+   实际 vendor:`tq_expf` ← FreeBSD-11 `e_expf.c`(经典纯 fp32 Cephes 系),`tq_expm1f` ← bionic `s_expm1f.c`,`tq_tanhf` ← bionic `s_tanhf.c`(内部 expm1f→tq_expm1f)。CPU TU 以 `-ffp-contract=off` 编译,GLSL 全 `precise`,常量双侧位模式,逐语句对应——CPU↔GPU 逐位一致由构造保证,与平台 libm 解耦。真机 math_probe 对拍(test_vulkan_i4.cpp)验证 Adreno 侧前提(precise 除法 correctly-rounded、int() 截断向零)。host 实测:vs Apple libm ≤1ulp(expf/expm1f,96-98% 逐位同)、≤2ulp(tanhf);p2_mid 16 ids 替换前后逐位不变,p1_short 贪心翻转但连贯。
 3. rope 表 host 预计算:每 token 上传 `[half]×2` float(theta=1e4 与 1e6 各一张),用 CPU 同代码路径生成 ⇒ powf/sincosf 完全不进 shader。
 4. GLSL 侧纪律:全程 `precise` 限定;`fma()` 显式写;禁止依赖 `inverseSqrt`/驱动 fast-math;归约结构按本清单的 lane 跨步与合并顺序 1:1 摆放。
 5. 平台迁移红线:换编译器/OS(如 Android NDK)后,ref 系 kernel 的 contraction 形态与 libm 都会变,须重新反汇编核对本文 §0/§2/§3/§5 的融合结论。

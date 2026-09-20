@@ -33,7 +33,7 @@
 | 0 | CPU i4 真机基线 + golden 采集(`scripts/collect_gemma4_golden.sh`:2 模型 × 3 prompt × {16,64} tok × 2 运行,含逐层 g4_dump、热门禁、meminfo) | golden 两次运行逐位可复现 | 脚本就绪(2b79b83),宿主机配方已验证;**待真机** |
 | 1 | i4 W4A8 Vulkan kernel(quantize + matvec)+ host 封装 + 逐位对拍 harness(`tests/test_vulkan_i4.cpp`,9 档 gemma4 真实形状 + 残组;止损点 B 计时探针) | GPU vs CPU sdot6 fp32 逐位一致 | 代码就绪(1b70b2b + arena 化 9c1eb41),双端编译绿;**待真机 parity** |
 | 2 | Gemma4VulkanEngine 骨架 v0(CPU 编排逐语句复制 forward + GPU i4 matvec)+ `--gemma4-vk` CLI 接线 + rmsnorm/rope bitwise shader(已写未接线) | v0 端到端 generated_ids 逐位 = CPU golden | 代码就绪(9c1eb41, 2d0157b);**待真机** |
-| 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | 未开始(attention 需 bionic expf 移植,最难,R2) |
+| 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | **前置已落地**(4227fad):portable math CPU/GPU 同源(tq_expf/tq_expm1f/tq_tanhf)+ attention/geglu/math_probe 三个 shader 已写(probe API 就绪,引擎未接线);**待真机对拍**(R2 收窄为 Adreno precise 合规性) |
 | 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | 未开始 |
 | 5 | main.cpp 正式集成(`--backend vulkan` 对 gemma4-i4 分支到执行器、内存预检计入 GPU 副本、verify_android.sh BACKEND 参数化) | host CTest + 真机 tests 全绿 + CPU 回归 | 最小接线已提前落地(--gemma4-vk);正式 gate 改造未开始 |
 | 6 | bench_gemma4_vulkan.sh(CPU vs GPU 配对、热门禁、RSS/温度)+ optimization_log/android.md/本文档回填 | bench 内嵌逐位比对 | 未开始 |
@@ -43,12 +43,12 @@
 | # | 风险 | 探测时点 | 处置 |
 |---|---|---|---|
 | R1 | 带宽无优势(统一内存共享 LPDDR5X,decode 带宽 bound) | Phase 1 计时探针 | **止损点 B**:lm_head/down_proj 单 kernel GPU > CPU sdot6 且全层外推无优势 → 终止,数据回填 |
-| R2 | bitwise 不可达(expf/tanhf/归约穷尽移植仍分叉) | Phase 3 | **止损点 A**:分歧不可收敛 → 提请降级(逐层 ULP 级 + generated_ids 逐位 + margin 监控);不接受则终止回退 CPU i4 |
+| R2 | bitwise 不可达(expf/tanhf/归约穷尽移植仍分叉) | Phase 3 | **已大幅收窄**(4227fad):expf/tanhf 改为 CPU/GPU 同源 vendored 多项式(逐位一致由构造保证,不依赖平台 libm);剩余 = Adreno 对 GLSL `precise` 的合规性(除法不得 reciprocal 近似、不得 contraction)——math_probe 定向阈值位 + 16 万随机点对拍验证。若仍分叉 → **止损点 A**:提请降级(逐层 ULP 级 + generated_ids 逐位 + margin 监控);不接受则终止回退 CPU i4 |
 | R3 | 单 buffer/分配上限 | Phase 2 | 按层分片 VkBuffer |
 | R4 | GPU 持续降频 | Phase 6 | 报告冷热两态 |
 | R5 | KV 共享拓扑复杂度超估 | Phase 2 | v1 收缩:仅 QAT 对称 + 固定 ctx + --ple-ssd(已在 create() gate 落地) |
 | R6 | 激活量化舍入不一致 | Phase 1 | harness 先单独对拍 quantize(int8 逐位)再对拍整 matvec(已落地) |
-| R7 | NDK contraction 与 Apple clang 不同 | Phase 0/3 | golden 采真机 NDK 产物;清单 §0.5 要求重新反汇编核对 |
+| R7 | NDK contraction 与 Apple clang 不同 | Phase 0/3 | **golden 路径已消解**(4227fad):attention l 更新/geglu·gelu inner/PLE 合并/proportional_rope 的 contraction 依赖全部钉死为显式 `std::fmaf`(= host 反汇编验证的形态),编译器行为不再影响逐位语义;剩余范围仅非 golden 的 ref 变体 |
 
 **总体止损**:R1/R2 触发且不接受降级 → 结论「GPU 路线不成立」,CPU i4(--ple-ssd + sdot6_mt)维持部署推荐;已完成 kernel/harness 作 experimental 保留,负结果回填 optimization_log。
 
@@ -57,8 +57,11 @@
 ## 文件地图(tiny-llm 侧)
 
 - `runtime/vulkan/gemma4_{quant_x_i4,matvec_i4,rmsnorm,rope}.comp` — 已交付的 4 个 shader
+- `kernels/math/portable_math.{h,cpp}` + `runtime/vulkan/portable_math.comp.inc` — tq_expf/tq_expm1f/tq_tanhf,CPU/GLSL 同源逐语句对应(-ffp-contract=off ↔ precise)
+- `runtime/vulkan/gemma4_{math_probe,geglu,attention}.comp` — Phase 3 前置 shader(对拍探针 / geglu·gelu_tanh 双模式 / 每 head 串行 online softmax)
 - `runtime/gemma4_vk_kernels.{h,cpp}` + stub — i4 内核 host 封装(arena 寻址,repack 共用)
 - `runtime/gemma4_vulkan.{h,cpp}` + stub — 引擎(v0 混合形态)
-- `tests/test_vulkan_i4.cpp` — 逐位对拍 + 计时探针(仅 TINYQWEN_HAS_VULKAN 注册)
+- `tests/test_vulkan_i4.cpp` — 逐位对拍 + 计时探针(仅 TINYQWEN_HAS_VULKAN 注册;含 math/geglu/attention 三个真机 parity 用例)
+- `tests/test_portable_math.cpp` — vendored math 精度门禁(特殊值精确 + 扫描 ≤2ulp + 单调性 + vs 平台 libm 诊断)
 - `scripts/collect_gemma4_golden.sh` — Phase 0 采集
 - `runtime/main.cpp` — `--gemma4-vk` 最小接线
