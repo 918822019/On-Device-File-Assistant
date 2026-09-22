@@ -67,6 +67,9 @@ class EdgeRuntime:
         self.tokenizer = None
 
         self.model_id = self._resolve_model_id(cfg)
+        # 用于响应展示的稳定模型 ID；self.model_id 可能是本地路径（EDGE_LOCAL_DIR）
+        # 或 GPTQ 仓库地址，不应暴露给调用方。
+        self.display_model_id = cfg.model_id
         self._ready = False
         self._load_model()
 
@@ -203,12 +206,18 @@ class EdgeRuntime:
         except Exception as exc:  # pragma: no cover
             self.logger.warning("bitsandbytes int4 加载失败，回退到模型原生精度: %s", exc)
 
-        return AutoModelForCausalLM.from_pretrained(
-            model_source,
-            dtype=dtype,
-            device_map=device_map,
-            trust_remote_code=True,
-        )
+        # 最终兜底：必须用 cfg.model_id（原始模型），而非 model_source（可能仍指向 GPTQ 仓库）。
+        # 此前复用 model_source 导致"放弃量化"的回退实际上仍在加载量化仓库，永远无法成功。
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                self.cfg.model_id,
+                dtype=dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+        except Exception as exc:  # pragma: no cover
+            self.logger.error("最终兜底加载也失败（model_id=%s）: %s", self.cfg.model_id, exc)
+            raise
 
     def generate(self, messages: list[dict], max_new_tokens: int | None = None) -> EdgeInferenceResult:
         if not self.ready:
@@ -258,5 +267,5 @@ class EdgeRuntime:
         return EdgeInferenceResult(
             text=text,
             confidence=recorder.confidence,
-            used_model=self.model_id,
+            used_model=self.display_model_id,
         )

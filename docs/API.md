@@ -174,7 +174,8 @@
 `reply`（补充线索）与 `selected_file_id`（直接确认某候选）二选一或都传；
 `selected_file_id` 优先。线索支持三类：字面词、时间（"上周的"）、来源（"微信群里的"）。
 
-返回结构同 `/search`。会话失效返回 404（重新发起搜索即可）。
+返回结构同 `/search`，其中 `query` 字段回填本次会话的原始查询（便于客户端展示上下文）。
+会话失效返回 404（重新发起搜索即可）。
 
 ### `POST /v1/search-agent/execute`
 
@@ -191,8 +192,8 @@
 - `open`：返回 `file_uri`，由端上打开
 - `share`：需要 `share_to`，返回 `share_payload`
 - `compare`：需要 `peer_file_id`，返回 `compare_payload`（双方时间、来源、预览、`recommended_keep` 推荐保留项）
-- `annotate`：需要 `note`，保存在执行上下文（内存）
-- `archive`：归档标记（内存）
+- `annotate`：需要 `note`，持久化到 `data/file_state.json`（重启不丢）
+- `archive`：归档标记，持久化到 `data/file_state.json`（重启不丢）
 
 ### `POST /v1/search-agent/rebuild-index`
 

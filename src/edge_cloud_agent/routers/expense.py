@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from time import time
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -135,10 +134,9 @@ def export(req: ExpenseExportRequest, request: Request):
     if service is None:
         raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
     claim_id = req.claim_id
-    manifest, materials = service.export_bundle(req)
+    export_id, manifest, materials = service.export_bundle(req)
     if not materials:
         raise HTTPException(status_code=404, detail="未找到可导出的材料")
-    export_id = f"exp_{int(time())}"
     if not claim_id and materials:
         claim_id = materials[0].claim_id
 
@@ -171,5 +169,6 @@ def rebuild_index(request: Request):
         imported=result.imported,
         skipped=result.skipped,
         errors=result.errors,
+        removed=result.removed,
         material_ids=result.material_ids,
     )

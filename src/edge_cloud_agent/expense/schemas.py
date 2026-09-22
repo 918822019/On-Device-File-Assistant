@@ -14,6 +14,8 @@ class ExpenseCollectRequest(BaseModel):
     title: str | None = Field(default=None, description="用户自定义标题")
     raw_text: str = Field(..., min_length=1, description="OCR/分享摘要文本")
     file_uri: str | None = Field(default=None, description="可选：文件路径/对象链接")
+    file_hash: str | None = Field(default=None, description="可选：文件内容 hash，用于增量判重")
+    file_size_bytes: int | None = Field(default=None, description="可选：文件大小（字节），用于增量判重")
     captured_at: str | None = Field(default=None, description="可选：原始截图/文件时间（ISO 字符串）")
     notes: str | None = Field(default=None, description="可选：额外备注")
 
@@ -108,4 +110,5 @@ class ExpenseRebuildIndexResponse(BaseModel):
     imported: int = 0
     skipped: int = 0
     errors: int = 0
+    removed: int = 0
     material_ids: list[str] = Field(default_factory=list)

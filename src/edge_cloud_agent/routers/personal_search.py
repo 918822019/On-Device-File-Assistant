@@ -219,7 +219,7 @@ def clarify(req: FileSearchSessionRequest, request: Request):
     )
 
     try:
-        session_id, candidates, state, should_disambiguate, question, selected_file_id = service.continue_search(
+        session_id, original_query, candidates, state, should_disambiguate, question, selected_file_id = service.continue_search(
             session_id=req.session_id,
             selected_file_id=req.selected_file_id,
             reply=req.reply,
@@ -252,7 +252,7 @@ def clarify(req: FileSearchSessionRequest, request: Request):
     )
 
     return FileSearchResponse(
-        query="",
+        query=original_query,
         session_id=session_id,
         state=state,
         needs_disambiguation=should_disambiguate,

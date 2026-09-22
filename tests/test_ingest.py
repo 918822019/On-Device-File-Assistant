@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -39,7 +39,7 @@ def test_captured_at_uses_file_mtime(env):
 
     captured = _file_captured_at(f)
     dt = datetime.fromisoformat(captured)
-    expected = datetime.utcnow() - timedelta(days=3)
+    expected = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=3)
     assert abs((dt - expected).total_seconds()) < 120, f"captured_at={captured} 应接近 3 天前"
 
     item = _build_item(service, cfg, f)

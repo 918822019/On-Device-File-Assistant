@@ -6,8 +6,15 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, NamedTuple
 from uuid import uuid4
+
+
+class _ExtractedFields(NamedTuple):
+    """collect() 字段抽取结果，替代每次调用都动态创建的匿名类。"""
+    amount: float | None
+    date: str | None
+    merchant: str | None
 
 from ..config import ExpenseConfig
 from ..embedding_runtime import EdgeEmbeddingRuntime
@@ -86,7 +93,7 @@ class ExpenseService:
         self.store = store
         self.embedding_runtime = embedding_runtime
 
-    def collect(self, req: ExpenseCollectRequest, claim_id: str) -> ExpenseMaterial:
+    def collect(self, req: ExpenseCollectRequest, claim_id: str, persist: bool = True) -> ExpenseMaterial:
         now = _now_iso()
         extracted = self._extract_fields(req.raw_text)
         keywords = self._extract_keywords(req.raw_text, req.doc_type, req.source_app, req.notes)
@@ -106,13 +113,15 @@ class ExpenseService:
             merchant=extracted.merchant,
             captured_at=req.captured_at,
             file_uri=req.file_uri,
+            file_hash=req.file_hash,
+            file_size_bytes=req.file_size_bytes,
             notes=req.notes,
             keywords=keywords,
             created_at=now,
             updated_at=now,
             embedding=embedding,
         )
-        self.store.add_or_update(material)
+        self.store.add_or_update(material, persist=persist)
         return material
 
     def search(self, req: ExpenseSearchRequest) -> list[SearchResult]:
@@ -157,7 +166,8 @@ class ExpenseService:
         missing = sorted(required_types - present_types)
         return total_amount, len(materials), list(missing)
 
-    def export_bundle(self, req: ExpenseExportRequest) -> tuple[str, list[ExpenseMaterial]]:
+    def export_bundle(self, req: ExpenseExportRequest) -> tuple[str, str, list[ExpenseMaterial]]:
+        """返回 (export_id, manifest_text, materials)，export_id 与 manifest 文本中的 ID 一致。"""
         if req.material_ids:
             materials = self.store.get_many(req.material_ids)
         else:
@@ -191,7 +201,7 @@ class ExpenseService:
                 lines.append(f"  - 文件: {material.file_uri}")
             lines.append("")
 
-        return "\n".join(lines), materials
+        return export_id, "\n".join(lines), materials
 
     def _embed_text(self, text: str) -> list[float] | None:
         if self.embedding_runtime is None:
@@ -207,11 +217,12 @@ class ExpenseService:
         except Exception:
             return None
 
-    def _extract_fields(self, text: str):
-        amount = self._extract_amount(text)
-        date = self._extract_date(text)
-        merchant = self._extract_merchant(text)
-        return type("Fields", (), {"amount": amount, "date": date, "merchant": merchant})()
+    def _extract_fields(self, text: str) -> _ExtractedFields:
+        return _ExtractedFields(
+            amount=self._extract_amount(text),
+            date=self._extract_date(text),
+            merchant=self._extract_merchant(text),
+        )
 
     @staticmethod
     def _extract_amount(text: str) -> float | None:

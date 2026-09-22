@@ -1,6 +1,11 @@
 """个人文件搜索：时间线索匹配、状态判定、clarify 重排回归。"""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _utcnow_naive() -> datetime:
+    """替代已弃用的 datetime.utcnow()，返回 naive UTC now。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 import pytest
 
@@ -56,30 +61,30 @@ def service(tmp_path) -> PersonalFileSearchService:
 # ---------------------------------------------------------------------------
 
 def test_time_match_today():
-    ok, reason = _has_time_match(_iso(datetime.utcnow()), "今天的会议记录")
+    ok, reason = _has_time_match(_iso(_utcnow_naive()), "今天的会议记录")
     assert ok and "今天" in reason
 
 
 def test_time_match_yesterday():
-    ok, reason = _has_time_match(_iso(datetime.utcnow() - timedelta(days=1)), "昨天拍的照片")
+    ok, reason = _has_time_match(_iso(_utcnow_naive() - timedelta(days=1)), "昨天拍的照片")
     assert ok and "昨天" in reason
 
 
 def test_time_match_last_week_within_window():
-    ok, _ = _has_time_match(_iso(datetime.utcnow() - timedelta(days=5)), "上周的聚餐照片")
+    ok, _ = _has_time_match(_iso(_utcnow_naive() - timedelta(days=5)), "上周的聚餐照片")
     assert ok
 
 
 def test_time_no_match_last_week_for_old_file():
     # 60 天前的文件不应命中"上周"
-    ok, _ = _has_time_match(_iso(datetime.utcnow() - timedelta(days=60)), "上周的聚餐照片")
+    ok, _ = _has_time_match(_iso(_utcnow_naive() - timedelta(days=60)), "上周的聚餐照片")
     assert not ok
 
 
 def test_time_match_recent_n_days():
-    ok, _ = _has_time_match(_iso(datetime.utcnow() - timedelta(days=2)), "最近3天的文件")
+    ok, _ = _has_time_match(_iso(_utcnow_naive() - timedelta(days=2)), "最近3天的文件")
     assert ok
-    ok, _ = _has_time_match(_iso(datetime.utcnow() - timedelta(days=10)), "最近3天的文件")
+    ok, _ = _has_time_match(_iso(_utcnow_naive() - timedelta(days=10)), "最近3天的文件")
     assert not ok
 
 
@@ -166,7 +171,7 @@ def test_rerank_empty(service):
 # ---------------------------------------------------------------------------
 
 def _days_ago_iso(days: int) -> str:
-    return _iso(datetime.utcnow() - timedelta(days=days))
+    return _iso(_utcnow_naive() - timedelta(days=days))
 
 
 def test_filter_reply_by_time_clue(service):

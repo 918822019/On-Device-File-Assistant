@@ -170,16 +170,20 @@ reply ─► _filter_candidates_by_reply 三路保留:
 1. **无中文分词**：长查询（如"上周群里发的聚餐照片"）整体是一个 token，
    文本路命中靠子串匹配常为 0，实际靠线索分支撑。接入 jieba 或端侧小模型
    分词是下一个提升点。
-2. **`"v" in haystack` 版本加分过松**：任何含字母 v 的路径/mime 都得 0.2
-   加分（临时目录名 `ec_verify` 都能触发噪声分）。
-3. **会话/备注/归档不持久化、无过期淘汰**：重启即丢，长期运行内存只增。
+2. ~~**`"v" in haystack` 版本加分过松**~~ ✅ 已修复：改为 `_VERSION_MARK_RE`
+   正则（`(?<![a-z0-9])v\d+` 或"版本"字样），且仅在查询带版本意图时才加分。
+3. ~~**会话/备注/归档不持久化、无过期淘汰**~~ ✅ 已修复：备注/归档落盘
+   `data/file_state.json`（`FileStateStore`，原子写）；会话 TTL 30 分钟 +
+   容量上限 200，惰性淘汰。
 4. **「上周」=14 天窗口较宽**：今天的文件也命中"上周"；是否收紧到 ISO 周
    是产品决策。
-5. **来源词表与路径识别不完全对齐**：`_SOURCE_KEYWORDS` 的 `image/office`
-   与 `_infer_source_from_path` 的 `gallery/camera` 之间靠 mime/doc_type
-   巧合兜住，缺显式映射表。
-6. 小项：`extraction_confidence` 恒 1.0（假指标）、export 的 `export_time`
-   语义不准（取的是材料更新时间）、`datetime.utcnow()` 弃用告警。
+5. ~~**来源词表与路径识别不完全对齐**~~ ✅ 已修复：引入 `_SOURCE_TEXT_ALIASES`
+   显式别名表（gallery↔image、camera↔screenshot、document↔office/pdf），
+   打分与过滤两侧共用同一口径。
+6. ~~小项：`extraction_confidence` 恒 1.0（假指标）、export 的 `export_time`
+   语义不准（取的是材料更新时间）、`datetime.utcnow()` 弃用告警~~ ✅ 全部已修复：
+   `extraction_confidence` 改为金额/日期/商户三字段命中占比；`export_time` 改为
+   真实导出时刻；测试中 `datetime.utcnow()` 替换为 `datetime.now(timezone.utc)`。
 
 ---
 

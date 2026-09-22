@@ -163,21 +163,23 @@ class EdgeCloudOrchestrator:
             return None
 
     def _edge_unavailable_msg(self, reason: str = "edge_unavailable_cloud_disabled") -> RoutingResult:
+        # used_source="none"、model=""：没有任何推理发生，不能谎报 edge 已作答
         return RoutingResult(
             final_text="端侧模型未就绪且未开启云端兜底，当前仅支持本地 tiny llm 推理。",
-            used_source="edge",
+            used_source="none",
             escalated=False,
             reason=reason,
-            model=self.edge_cfg.model_id,
+            model="",
         )
 
     def _edge_error_msg(self, reason: str = "edge_error_cloud_disabled") -> RoutingResult:
+        # 同上：推理异常时没有有效输出，source/model 不能填 edge
         return RoutingResult(
             final_text="端侧推理异常，当前未开启云端兜底。",
-            used_source="edge",
+            used_source="none",
             escalated=False,
             reason=reason,
-            model=self.edge_cfg.model_id,
+            model="",
         )
 
     def _cloud_unavailable_msg(self, reason: str) -> RoutingResult:

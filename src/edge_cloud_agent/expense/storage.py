@@ -26,6 +26,8 @@ class ExpenseMaterial:
     merchant: str | None = None
     captured_at: str | None = None
     file_uri: str | None = None
+    file_hash: str | None = None
+    file_size_bytes: int | None = None
     notes: str | None = None
     keywords: list[str] = field(default_factory=list)
     created_at: str = ""
@@ -49,6 +51,8 @@ class ExpenseMaterial:
             merchant=payload.get("merchant"),
             captured_at=payload.get("captured_at"),
             file_uri=payload.get("file_uri"),
+            file_hash=payload.get("file_hash"),
+            file_size_bytes=payload.get("file_size_bytes"),
             notes=payload.get("notes"),
             keywords=payload.get("keywords", []) or [],
             created_at=payload.get("created_at", ""),
@@ -66,22 +70,33 @@ class ExpenseStore:
     def __init__(self, path: str) -> None:
         self.path = Path(path).resolve()
         self._items: dict[str, ExpenseMaterial] = {}
+        # file_uri → material_id 索引，避免 get_by_file_uri 每次 O(N) 遍历
+        self._by_file_uri: dict[str, str] = {}
         self._lock = Lock()
         self._load()
 
-    def add_or_update(self, material: ExpenseMaterial) -> None:
+    def add_or_update(self, material: ExpenseMaterial, persist: bool = True) -> None:
+        """写入内存索引；persist=False 时延迟落盘（批量导入场景配合 flush 使用）。"""
         with self._lock:
             self._items[material.material_id] = material
+            if material.file_uri:
+                self._by_file_uri[material.file_uri] = material.material_id
+            if persist:
+                self._persist()
+
+    def flush(self) -> None:
+        """将当前内存索引一次性落盘。"""
+        with self._lock:
             self._persist()
 
     def get(self, material_id: str) -> ExpenseMaterial | None:
         return self._items.get(material_id)
 
     def get_by_file_uri(self, file_uri: str) -> ExpenseMaterial | None:
-        for material in self._items.values():
-            if material.file_uri == file_uri:
-                return material
-        return None
+        material_id = self._by_file_uri.get(file_uri)
+        if material_id is None:
+            return None
+        return self._items.get(material_id)
 
     def list_all(self) -> list[ExpenseMaterial]:
         return list(self._items.values())
@@ -96,6 +111,16 @@ class ExpenseStore:
             if material is not None:
                 result.append(material)
         return result
+
+    def delete_by_file_uri(self, file_uri: str, persist: bool = True) -> bool:
+        with self._lock:
+            material_id = self._by_file_uri.pop(file_uri, None)
+            if material_id is None:
+                return False
+            self._items.pop(material_id, None)
+            if persist:
+                self._persist()
+            return True
 
     def all_claim_ids(self) -> list[str]:
         return sorted({m.claim_id for m in self._items.values()})
@@ -114,6 +139,8 @@ class ExpenseStore:
                     payload = json.loads(row)
                     material = ExpenseMaterial.from_dict(payload)
                     self._items[material.material_id] = material
+                    if material.file_uri:
+                        self._by_file_uri[material.file_uri] = material.material_id
                 except Exception:
                     # 向后兼容：一行坏数据直接跳过，避免影响服务启动
                     continue

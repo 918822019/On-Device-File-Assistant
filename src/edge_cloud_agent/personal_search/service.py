@@ -29,7 +29,9 @@ TIME_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"上个?月"), 30),
     (re.compile(r"本周"), 7),
     (re.compile(r"最近(\d+)?天"), 3),
-    (re.compile(r"今天|昨日|昨天|前天|明天"), 1),
+    # "明天" 不纳入时间线索：文件 captured_at 是过去时刻，"明天"作为时间约束
+    # 语义上无意义，纳入后会误匹配最近 24 小时的所有文件。
+    (re.compile(r"今天|昨日|昨天|前天"), 1),
 ]
 
 _CLUE_COLOR_TOKENS = {
@@ -185,9 +187,10 @@ def _has_time_match(captured_at: str | None, query: str) -> tuple[bool, str]:
                 return True, "时间线索匹配: 前天"
             if "上周" in q and (now - item_time) <= timedelta(days=14):
                 return True, "时间线索匹配: 上周"
-            if "上月" in q and (now - item_time) <= timedelta(days=45):
+            if ("上月" in q or "上个月" in q) and (now - item_time) <= timedelta(days=45):
                 return True, "时间线索匹配: 上月"
-            if "本周" in q and item_time.date().isocalendar().week == now.date().isocalendar().week:
+            # isocalendar()[:2] = (iso_year, iso_week)；只比较 week 不比较 year 会跨年误匹配
+            if "本周" in q and item_time.date().isocalendar()[:2] == now.date().isocalendar()[:2]:
                 return True, "时间线索匹配: 本周"
             if q.startswith("最近") and "天" in q:
                 try:
@@ -427,14 +430,6 @@ class PersonalFileSearchService:
             )
             raise ValueError("file_not_found")
 
-        def _to_dt(value: str | None) -> datetime | None:
-            if not value:
-                return None
-            try:
-                return datetime.fromisoformat(value)
-            except Exception:
-                return None
-
         left_time = _to_dt(left.captured_at)
         right_time = _to_dt(right.captured_at)
         if left_time and right_time:
@@ -445,6 +440,7 @@ class PersonalFileSearchService:
             reason = "未命中时间戳，按文件路径字典序兜底"
 
         _LOGGER.info(
+
             "personal-search-compare-built",
             extra={
                 "event": "action.compare_ok",
@@ -552,12 +548,13 @@ class PersonalFileSearchService:
         reply: str | None,
         top_k: int = 6,
         trace_id: str | None = None,
-    ) -> tuple[str, list[FileSearchCandidate], str, bool, str | None, str | None]:
+    ) -> tuple[str, str, list[FileSearchCandidate], str, bool, str | None, str | None]:
         """对 clarify 会话进行下一轮处理。
 
+        返回 (session_id, original_query, candidates, state, should_disambiguate, question, selected_file_id)。
         - selected_file_id 存在时优先直接确认；
-- 否则用 reply 文本过滤/重排候选；
-- 无结果时返回 not_found 并附带二次引导语。
+        - 否则用 reply 文本过滤/重排候选；
+        - 无结果时返回 not_found 并附带二次引导语。
         """
 
         started = perf_counter()
@@ -604,6 +601,7 @@ class PersonalFileSearchService:
                 )
                 return (
                     session_id,
+                    session.query,
                     [self._to_schema(selected_candidate)],
                     "resolved",
                     False,
@@ -643,7 +641,7 @@ class PersonalFileSearchService:
                         "reply_len": len(reply),
                     },
                 )
-                return session_id, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/群聊/颜色/场景。", None
+                return session_id, session.query, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/群聊/颜色/场景。", None
 
         if not candidates:
             _LOGGER.info(
@@ -657,7 +655,7 @@ class PersonalFileSearchService:
                     "duration_ms": round((perf_counter() - started) * 1000, 2),
                 },
             )
-            return session_id, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/来源/场景。", None
+            return session_id, session.query, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/来源/场景。", None
 
         candidates = self._rerank_within(candidates, normalized_reply if normalized_reply else session.query, top_k)
 
@@ -682,6 +680,7 @@ class PersonalFileSearchService:
         )
         return (
             session_id,
+            session.query,
             [self._to_schema(candidate) for candidate in candidates],
             state,
             should_disambiguate,
