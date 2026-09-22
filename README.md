@@ -48,6 +48,13 @@ pytest tests/
 完整步骤（embedding 权重下载、云端启用、常见报错排查）见
 **[docs/QUICKSTART.md](docs/QUICKSTART.md)**。
 
+部署到 Linux 服务器（systemd 托管、开机自启、一键权重下载与健康检查）：
+
+```bash
+bash scripts/deploy.sh                       # 一键部署，详见 docs/DEPLOYMENT.md
+bash scripts/service.sh status               # start/stop/restart/status/logs/health
+```
+
 ---
 
 ## 架构概览
@@ -192,6 +199,7 @@ JSONL 存储往返与容错、增量扫描生命周期（导入/跳过/变更重
 | 文档 | 内容 |
 |---|---|
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | 安装、权重下载、启动、云端启用、FAQ |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Linux 服务器部署：一键脚本、systemd、服务管理、排错 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 端云路由架构、文件职责、设计要点 |
 | [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md) | 业务层两条线的机制细节与遗留清单 |
 | [docs/API.md](docs/API.md) | 全部接口的请求/响应示例 + 日志字典 |

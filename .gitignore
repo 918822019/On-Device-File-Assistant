@@ -69,3 +69,6 @@ fake*_hf.pt
 # ---- 日志 ----
 *.log
 logs/
+
+# ---- 部署（PID 托管模式，见 scripts/service.sh）----
+.server.pid

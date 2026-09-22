@@ -1,0 +1,36 @@
+# systemd unit 模板 —— 由 scripts/deploy.sh 渲染占位符后安装到
+# /etc/systemd/system/edge-cloud-agent.service，请勿手工拷贝本文件。
+#
+# 占位符：__ROOT_DIR__（仓库绝对路径）/ __RUN_USER__（运行用户）
+#         __HOST__ / __PORT__（监听地址与端口）
+[Unit]
+Description=Edge-Cloud Hybrid Agent (FastAPI, edge-first LLM)
+Documentation=file:__ROOT_DIR__/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+WorkingDirectory=__ROOT_DIR__
+Environment=HOST=__HOST__
+Environment=PORT=__PORT__
+# 日志即时进 journal，不缓冲
+Environment=PYTHONUNBUFFERED=1
+# 复用 run.sh：venv 解释器选择、.env 加载（环境变量优先语义）都由它处理
+ExecStart=/usr/bin/env bash __ROOT_DIR__/scripts/run.sh
+Restart=on-failure
+RestartSec=10
+# 防止权重缺失等场景下无限快速重启刷爆 journal
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# 启动阶段同步加载 ~9.5GiB 端侧模型，CPU 上以分钟计；Type=simple 不受
+# TimeoutStartSec 约束，但停机给足时间让 watch 线程优雅退出
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=edge-cloud-agent
+
+[Install]
+WantedBy=multi-user.target
