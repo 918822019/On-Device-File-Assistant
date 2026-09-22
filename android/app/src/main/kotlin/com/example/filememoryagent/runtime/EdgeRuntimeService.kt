@@ -55,7 +55,7 @@ class EdgeRuntimeService : LifecycleService() {
     private val indexStore = LocalFileIndexStore(this)
     private val dataPaths = EdgeDataPaths(this)
 
-    private var periodicJob: Job = Job()
+    private var periodicJob: Job? = null
     private var debounceJob: Job? = null
     private val observers = mutableListOf<ContentObserver>()
     private var lastScanSummary: LocalScanResult? = null
@@ -130,7 +130,7 @@ class EdgeRuntimeService : LifecycleService() {
         val observerCount = observers.size
         observers.forEach { contentResolver.unregisterContentObserver(it) }
         observers.clear()
-        periodicJob.cancel()
+        periodicJob?.cancel()
         debounceJob?.cancel()
         serviceScope.cancel()
         Log.i(TAG, "edge-runtime-destroyed")

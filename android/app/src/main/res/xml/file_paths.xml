@@ -3,4 +3,11 @@
     <files-path name="app_internal_files" path="." />
     <cache-path name="app_cache" path="." />
     <external-path name="external_storage" path="." />
+    <!--
+        noBackupFilesDir（/data/data/<pkg>/no_backup/）与 filesDir 是兄弟目录，
+        FileProvider 没有对应的 path 元素，无法直接覆盖。
+        日志分享已通过复制到 cacheDir 再 getUriForFile 规避（见 MainActivity.shareLogs）。
+        若后续需要通过 FileProvider 暴露 noBackupFilesDir 下的文件，
+        应沿用同样的 cacheDir 中转模式，不要在此处添加 root-path（过于宽泛）。
+    -->
 </paths>

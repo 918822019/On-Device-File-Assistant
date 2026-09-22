@@ -115,13 +115,13 @@ class MainViewModel(
                 _state.update {
                     it.copy(logs = repository.logs.value)
                 }
-                _actionEvents.value = when (action) {
+                // if-else 互斥：status != ok 时直接赋 Error，不再先写正常事件再覆盖
+                _actionEvents.value = if (result.status != "ok") {
+                    ActionResult.Error("动作执行失败：${result.message}")
+                } else when (action) {
                     "open" -> ActionResult.Open(result.fileUri.orEmpty(), result.fileTitle.orEmpty())
                     "share" -> ActionResult.Share(result.sharePayload, result.message)
                     else -> ActionResult.Message(result.fileTitle.orEmpty(), result.message)
-                }
-                if (result.status != "ok") {
-                    _actionEvents.value = ActionResult.Error("动作执行失败：${result.message}")
                 }
             } catch (e: Exception) {
                 _actionEvents.value = ActionResult.Error(e.message ?: "执行失败")

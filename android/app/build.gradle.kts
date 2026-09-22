@@ -33,9 +33,9 @@ android {
         buildConfig = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.15"
-    }
+    // Kotlin 2.0.0 起 Compose 编译器由 org.jetbrains.kotlin.plugin.compose 管理，
+    // 不再需要（也不应设置）composeOptions.kotlinCompilerExtensionVersion。
+    // 旧值 "1.5.15" 对应 Kotlin 1.9.x，与 2.0.0 并列会导致构建冲突。
 
     packaging {
         resources {

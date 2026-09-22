@@ -108,18 +108,22 @@ class LocalFileIndexStore(context: Context) {
     }
 
     private fun inferSourceHint(path: String, mimeType: String): String {
-        val normalized = (path + mimeType).lowercase(Locale.getDefault())
+        // path 与 mimeType 分别 lowercase，不再重复拼接 mimeType
+        val normalizedPath = path.lowercase(Locale.getDefault())
+        val normalizedMime = mimeType.lowercase(Locale.getDefault())
+        val combined = normalizedPath + normalizedMime
         return when {
-            normalized.contains("wechat") || normalized.contains("微信") || normalized.contains("weixin") -> "wechat"
-            normalized.contains("mail") || normalized.contains("邮箱") || normalized.contains("gmail") -> "email"
-            // dcim 是 Android 相机标准目录；原实现把 "photo" 写了两遍，是笔误
-            normalized.contains("camera") || normalized.contains("dcim") || normalized.contains("photo") -> "camera"
-            normalized.contains("screenshot") || normalized.contains("截图") -> "screenshot"
-            normalized.contains("download") || normalized.contains("downloads") -> "downloads"
-            normalized.contains("documents") || normalized.contains("文档") || normalized.contains("docs") || normalized.contains("doc") -> "document"
-            normalized.contains("pdf") || normalized.contains("ppt") || normalized.contains("excel") -> "office"
-            normalized.startsWith("image/") -> "gallery"
-            normalized.startsWith("video/") -> "video"
+            combined.contains("wechat") || combined.contains("微信") || combined.contains("weixin") -> "wechat"
+            combined.contains("mail") || combined.contains("邮箱") || combined.contains("gmail") -> "email"
+            // dcim 是 Android 相机标准目录
+            combined.contains("camera") || combined.contains("dcim") || combined.contains("photo") -> "camera"
+            combined.contains("screenshot") || combined.contains("截图") -> "screenshot"
+            combined.contains("download") || combined.contains("downloads") -> "downloads"
+            combined.contains("documents") || combined.contains("文档") || combined.contains("docs") || combined.contains("doc") -> "document"
+            combined.contains("pdf") || combined.contains("ppt") || combined.contains("excel") -> "office"
+            // startsWith 只对 mimeType 本身有意义，拼接后的 combined 永远不会以 "image/" 开头
+            normalizedMime.startsWith("image/") -> "gallery"
+            normalizedMime.startsWith("video/") -> "video"
             else -> "local"
         }
     }
@@ -190,7 +194,7 @@ class LocalFileIndexStore(context: Context) {
                     }
                 }
 
-                val sourceHint = inferSourceHint(pathHint + mimeType, mimeType)
+                val sourceHint = inferSourceHint(pathHint, mimeType)
                 out.add(
                     LocalIndexedFile(
                         fileId = computeFileId(contentUri),
@@ -233,29 +237,40 @@ class LocalFileIndexStore(context: Context) {
             val collected = collectFromFilesUri(resolver)
             // 命中 LIMIT 上限说明可能有文件被静默截断，日志显式标注
             val truncated = collected.size >= MAX_INDEX_SIZE
-            val upserted = ArrayList<LocalIndexedFile>()
+
+            val collectedIds = collected.map { it.fileId }.toSet()
+            val previousIds = previous.keys.toSet()
+
+            var newCount = 0
+            var updatedCount = 0
+            var unchangedCount = 0
 
             synchronized(_itemsById) {
-                val seen = linkedSetOf<String>()
                 collected.forEach { item ->
+                    val existing = previous[item.fileId]
+                    if (existing == null) {
+                        newCount++
+                    } else if (existing.dateModified != item.dateModified || existing.sizeBytes != item.sizeBytes) {
+                        updatedCount++
+                    } else {
+                        unchangedCount++
+                    }
                     _itemsById[item.fileId] = item
-                    seen.add(item.fileId)
                 }
-                _itemsById.keys.retainAll(seen)
-                upserted.addAll(collected)
+                _itemsById.keys.retainAll(collectedIds)
             }
 
             val current = synchronized(_itemsById) { LinkedHashMap(_itemsById) }
             persistUnsafe(current)
 
-            val unchanged = current.values.count { previous.containsKey(it.fileId) }
-            val removed = previous.size - unchanged
+            // removed = 旧索引中存在但本次扫描未命中的文件（集合差）
+            val removedCount = (previousIds - collectedIds).size
             val duration = System.currentTimeMillis() - startedAt
             val result = LocalScanResult(
                 scanned = collected.size,
-                upserted = upserted.size,
-                removed = removed,
-                unchanged = unchanged,
+                upserted = newCount + updatedCount,
+                removed = removedCount,
+                unchanged = unchangedCount,
                 durationMs = duration,
                 reason = reason,
             )

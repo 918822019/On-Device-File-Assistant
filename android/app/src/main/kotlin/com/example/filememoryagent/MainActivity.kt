@@ -67,8 +67,15 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grantMap ->
-        val allGranted = grantMap.values.all { it }
-        if (allGranted) {
+        // 存储权限是服务启动的必要条件；通知权限被拒不阻塞服务，仅提示
+        val storageGranted = hasStoragePermissions()
+        val notificationGranted = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU ||
+            grantMap[Manifest.permission.POST_NOTIFICATIONS] == true
+        if (storageGranted) {
+            if (!notificationGranted) {
+                RuntimeEventLog.log(this, "permission", "notification_denied")
+                Toast.makeText(this, "未授予通知权限，服务通知不可见", Toast.LENGTH_SHORT).show()
+            }
             RuntimeEventLog.log(this, "permission", "storage_granted")
             startEdgeRuntimeService()
             Toast.makeText(this, "已获得存储权限，开始监听文件变更", Toast.LENGTH_SHORT).show()
@@ -160,6 +167,7 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.READ_MEDIA_IMAGES,
                 Manifest.permission.READ_MEDIA_VIDEO,
                 Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.POST_NOTIFICATIONS,
             )
         } else {
             arrayOf(

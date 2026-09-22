@@ -71,6 +71,29 @@ data class FileActionRequest(
     val note: String? = null,
 )
 
+data class CompareFilePayload(
+    @SerializedName("file_id")
+    val fileId: String? = null,
+    val title: String? = null,
+    @SerializedName("source_app")
+    val sourceApp: String? = null,
+    @SerializedName("captured_at")
+    val capturedAt: String? = null,
+    @SerializedName("score_hint")
+    val scoreHint: String? = null,
+    val archived: Boolean = false,
+    val note: String? = null,
+)
+
+data class ComparePayload(
+    val left: CompareFilePayload? = null,
+    val right: CompareFilePayload? = null,
+    @SerializedName("recommended_keep")
+    val recommendedKeep: String? = null,
+    @SerializedName("recommended_reason")
+    val recommendedReason: String? = null,
+)
+
 data class FileActionResponse(
     val action: String,
     val status: String,
@@ -84,7 +107,7 @@ data class FileActionResponse(
     @SerializedName("share_payload")
     val sharePayload: Map<String, String>? = null,
     @SerializedName("compare_payload")
-    val comparePayload: Map<String, String>? = null,
+    val comparePayload: ComparePayload? = null,
     val annotations: String? = null,
     val archived: Boolean = false,
     @SerializedName("next_action_suggestions")
@@ -96,6 +119,8 @@ data class RebuildIndexResponse(
     val imported: Int,
     val skipped: Int,
     val errors: Int,
+    val removed: Int = 0,
+    @SerializedName("material_ids")
     val materialIds: List<String> = emptyList(),
 )
 
