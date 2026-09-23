@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>端上文件助手 · 端云结合 Agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <div>
+      <h1>端上文件助手</h1>
+      <p class="subtitle">端侧优先 · 云端可选 · 数据全本地</p>
+    </div>
+  </div>
+  <div class="server-status">
+    <span id="health-dot" class="dot dot-unknown" title="服务状态"></span>
+    <span id="health-text" class="health-text">检测中…</span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="search">🔍 文件搜索</button>
+  <button class="tab" data-tab="chat">💬 端云聊天</button>
+  <button class="tab" data-tab="expense">🧾 报销材料</button>
+</nav>
+
+<main>
+  <!-- ==================== 文件搜索 ==================== -->
+  <section id="tab-search" class="tab-panel active">
+    <div class="panel">
+      <div class="search-row">
+        <input id="sq" type="text" maxlength="260" placeholder="模糊口述，例如：上周群里发的聚餐照片" autocomplete="off">
+        <button id="search-btn" class="btn btn-primary">搜索</button>
+        <button id="rebuild-file-btn" class="btn btn-ghost" title="重新扫描 FILE_MEMORY_SOURCE_DIR 并重建向量索引">重建索引</button>
+      </div>
+      <div id="rebuild-file-result" class="hint-line"></div>
+    </div>
+
+    <div id="search-session" class="panel hidden">
+      <div class="session-head">
+        <span id="state-badge" class="badge"></span>
+        <span id="session-query" class="session-query"></span>
+        <button id="reset-session" class="btn btn-ghost btn-sm">新搜索</button>
+      </div>
+      <div id="clarify-question" class="question hidden"></div>
+
+      <div id="candidates" class="candidates"></div>
+
+      <div id="clarify-row" class="clarify-row hidden">
+        <input id="clarify-input" type="text" maxlength="160" placeholder="补充线索：上周的 / 微信群里的 / 聚餐…" autocomplete="off">
+        <button id="clarify-btn" class="btn btn-primary">追问</button>
+      </div>
+      <div id="action-suggestions" class="suggestions hidden"></div>
+    </div>
+
+    <div id="action-result" class="panel hidden">
+      <h3>动作结果 <button id="close-action-result" class="btn btn-ghost btn-sm">收起</button></h3>
+      <div id="action-result-body"></div>
+    </div>
+  </section>
+
+  <!-- ==================== 端云聊天 ==================== -->
+  <section id="tab-chat" class="tab-panel">
+    <div class="panel chat-panel">
+      <div id="chat-log" class="chat-log">
+        <div class="chat-empty">
+          和端侧 gemma-4-E2B 聊两句。路由决策（端侧/云端/降级原因）会随回复展示。<br>
+          <span class="muted">CPU 推理首 token 以秒计，长回复可能需要几分钟，请耐心等待。</span>
+        </div>
+      </div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" rows="2" maxlength="4000" placeholder="输入消息，Enter 发送 / Shift+Enter 换行"></textarea>
+        <div class="chat-side">
+          <label class="checkbox-line"><input type="checkbox" id="force-cloud"> force_cloud（直连云端）</label>
+          <button id="chat-send" class="btn btn-primary">发送</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== 报销材料 ==================== -->
+  <section id="tab-expense" class="tab-panel">
+    <div class="expense-grid">
+      <div class="panel">
+        <h3>📥 收进来 <span class="muted">/v1/expense/collect</span>
+          <button id="rebuild-expense-btn" class="btn btn-ghost btn-sm" title="扫描 EXPENSE_WATCH_DIR">重建索引</button>
+        </h3>
+        <div id="rebuild-expense-result" class="hint-line"></div>
+        <form id="collect-form" class="form-grid">
+          <label>报销单号 claim_id<input name="claim_id" type="text" placeholder="留空用默认单"></label>
+          <label>材料类型 doc_type
+            <select name="doc_type">
+              <option value="invoice">invoice 发票</option>
+              <option value="receipt">receipt 小票</option>
+              <option value="bank_transfer">bank_transfer 转账记录</option>
+              <option value="approval">approval 审批单</option>
+              <option value="other">other 其他</option>
+            </select>
+          </label>
+          <label>来源 source_app<input name="source_app" type="text" value="web" placeholder="微信/邮件/图库…"></label>
+          <label>标题 title（可空）<input name="title" type="text" placeholder="自动生成"></label>
+          <label class="span-2">原文 raw_text *
+            <textarea name="raw_text" rows="4" required placeholder="商户: 京东  金额: 128.00 元  日期: 2026-09-01"></textarea>
+          </label>
+          <div class="span-2"><button type="submit" class="btn btn-primary">收进来</button></div>
+        </form>
+        <div id="collect-result"></div>
+      </div>
+
+      <div class="panel">
+        <h3>🔎 找回来 <span class="muted">/v1/expense/search</span></h3>
+        <form id="esearch-form" class="form-grid">
+          <label>关键词<input name="keyword" type="text" placeholder="留空按更新时间倒序"></label>
+          <label>claim_id<input name="claim_id" type="text" placeholder="可空"></label>
+          <label>金额 ≥<input name="min_amount" type="number" step="0.01" min="0" placeholder="不限"></label>
+          <label>金额 ≤<input name="max_amount" type="number" step="0.01" min="0" placeholder="不限"></label>
+          <label>日期起<input name="from_date" type="date"></label>
+          <label>日期止<input name="to_date" type="date"></label>
+          <div class="span-2"><button type="submit" class="btn btn-primary">找回来</button></div>
+        </form>
+        <div id="esearch-result"></div>
+      </div>
+
+      <div class="panel">
+        <h3>📤 拿出去 <span class="muted">/v1/expense/export</span></h3>
+        <form id="export-form" class="form-grid">
+          <label>claim_id<input name="claim_id" type="text" placeholder="按报销单导出"></label>
+          <label class="checkbox-label"><input type="checkbox" name="include_raw_text"> 清单携带原文</label>
+          <div class="span-2"><button type="submit" class="btn btn-primary">生成清单</button></div>
+        </form>
+        <div id="export-result"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast-host"></div>
+<script src="app.js"></script>
+</body>
+</html>

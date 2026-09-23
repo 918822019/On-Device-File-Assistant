@@ -10,12 +10,14 @@ import logging
 import os
 import uuid
 import threading
+from pathlib import Path
 from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 
 from .agent import EdgeCloudOrchestrator
 from .config import (
@@ -132,6 +134,17 @@ def create_app() -> FastAPI:
     app.include_router(embeddings_router)
     app.include_router(expense_router)
     app.include_router(personal_search_router)
+
+    # Web UI：同源静态托管（repo/web/）。同源意味着零 CORS 配置；
+    # WSL2 下 Windows 浏览器经 localhost 端口转发直达，见 docs/WEB_UI.md。
+    # 注册在所有 API 路由之后，不会遮蔽 /v1/* 与 /health。
+    web_dir = Path(__file__).resolve().parents[2] / "web"
+    if web_dir.is_dir():
+        app.mount("/web", StaticFiles(directory=str(web_dir), html=True), name="web")
+
+        @app.get("/", include_in_schema=False)
+        def _web_root() -> RedirectResponse:
+            return RedirectResponse(url="/web/")
 
     @app.middleware("http")
     async def add_trace_id(request: Request, call_next):

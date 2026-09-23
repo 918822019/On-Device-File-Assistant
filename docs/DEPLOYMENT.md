@@ -94,6 +94,12 @@ bash scripts/service.sh health    # 仅健康检查
 10 分钟内最多重启 5 次防刷爆）；否则 PID 文件托管（`.server.pid` + `logs/edge-cloud-agent.log`，
 已 gitignore），适合容器与开发机。
 
+## 三点五、WSL 部署特记
+
+后端跑在 WSL2 时全套脚本同样可用（WSL 开启 systemd 后 `deploy.sh` 直接装 unit；
+Windows 浏览器经 localhost 转发访问 `http://localhost:9000/` 的 Web UI）。
+镜像网络/端口代理、权重不要放 `/mnt/c` 等注意事项见 **[WEB_UI.md](WEB_UI.md)**。
+
 ## 四、网络与客户端接入
 
 - 服务默认监听 `0.0.0.0:9000`。放行端口：

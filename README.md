@@ -99,6 +99,7 @@ flowchart LR
 | `personal_search/` | 文件搜索业务线：service（检索/消歧/动作）、ingest（扫描/增量/清理）、vector_index（FAISS）、storage（JSONL）、schemas |
 | `expense/` | 报销业务线：service（抽取/检索/导出）、ingest（watch 目录）、storage、schemas |
 | `routers/` | chat / embeddings / expense / personal_search 四组路由 |
+| `web/` | Web UI（FastAPI 同源静态托管 `/web`，原生 JS 无构建；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
 | `text_utils.py` | 共享中英文分词器（两条业务线统一口径） |
 | `tests/` | 业务层单测（35 例） |
 | `android/` | Android MVP 客户端（Kotlin + Compose，见 [android/README.md](android/README.md)） |
@@ -200,6 +201,7 @@ JSONL 存储往返与容错、增量扫描生命周期（导入/跳过/变更重
 |---|---|
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | 安装、权重下载、启动、云端启用、FAQ |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Linux 服务器部署：一键脚本、systemd、服务管理、排错 |
+| [docs/WEB_UI.md](docs/WEB_UI.md) | Web 页面功能说明与 WSL 部署（localhost 转发 / 镜像网络 / systemd） |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 端云路由架构、文件职责、设计要点 |
 | [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md) | 业务层两条线的机制细节与遗留清单 |
 | [docs/API.md](docs/API.md) | 全部接口的请求/响应示例 + 日志字典 |
