@@ -15,10 +15,12 @@
 | POST | `/v1/expense/search` | 报销：找回来 |
 | POST | `/v1/expense/export` | 报销：拿出去 |
 | POST | `/v1/expense/rebuild-index` | 报销：手动触发 watch 目录扫描 |
+| POST | `/v1/expense/correct` | 报销：人工纠正抽取字段（计入复盘指标） |
 | POST | `/v1/search-agent/search` | 文件搜索：首查 |
 | POST | `/v1/search-agent/clarify` | 文件搜索：追问消歧 |
 | POST | `/v1/search-agent/execute` | 文件搜索：命中后动作 |
 | POST | `/v1/search-agent/rebuild-index` | 文件搜索：手动重建索引 |
+| GET | `/v1/metrics` | 复盘指标（报销回访/补齐/纠正 + 文件搜索追问收敛漏斗） |
 
 ---
 
@@ -135,6 +137,26 @@
 ```
 
 > pdf/图片读不出文本属于预期跳过（计入 `skipped`，不计 `errors`）。
+
+### `POST /v1/expense/correct`
+
+```json
+{
+  "material_id": "bba3282cb754...",
+  "extracted_amount": 130.5,
+  "merchant": "京东世纪贸易"
+}
+```
+
+只传要改的字段（`extracted_amount` / `extracted_date` / `merchant` / `title`），
+None = 不改。返回 `corrected_fields`（实际改动列表；传值与现值一致时为空，
+不计入复盘「纠正次数」）。`material_id` 不存在返回 404。
+
+### `GET /v1/metrics`
+
+无参数。返回报销（14 天回访率 / 1 小时补齐率 / 纠正次数）与文件搜索
+（追问收敛率 / 收敛且执行动作率 / 会话漏斗）指标；比率分母为 0 时为
+`null`（样本不足）。完整口径与已知偏差见 **[METRICS.md](METRICS.md)**。
 
 ---
 

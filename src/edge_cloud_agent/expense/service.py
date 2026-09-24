@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
 from uuid import uuid4
@@ -21,6 +21,7 @@ from ..embedding_runtime import EdgeEmbeddingRuntime
 from ..text_utils import tokenize
 from .schemas import (
     ExpenseCollectRequest,
+    ExpenseCorrectRequest,
     ExpenseExportRequest,
     ExpenseSearchRequest,
 )
@@ -123,6 +124,28 @@ class ExpenseService:
         )
         self.store.add_or_update(material, persist=persist)
         return material
+
+    def correct(self, req: ExpenseCorrectRequest) -> tuple[ExpenseMaterial, list[str]]:
+        """人工纠正抽取字段：只更新非 None 且实际变化的字段。
+
+        material_id 不存在时抛 KeyError（路由层映射 404）。返回 (材料, 实际改动字段)，
+        改动为空表示传值与现值一致，不计入纠正次数。
+        ExpenseMaterial 是 frozen dataclass：用 dataclasses.replace 生成新实例落盘。
+        """
+
+        material = self.store.get(req.material_id)
+        if material is None:
+            raise KeyError(req.material_id)
+        changes: dict = {}
+        for field_name in ("title", "extracted_amount", "extracted_date", "merchant"):
+            new_value = getattr(req, field_name)
+            if new_value is None:
+                continue
+            if getattr(material, field_name) != new_value:
+                changes[field_name] = new_value
+        updated = replace(material, **changes, updated_at=_now_iso())
+        self.store.add_or_update(updated)
+        return updated, list(changes)
 
     def search(self, req: ExpenseSearchRequest) -> list[SearchResult]:
         keyword = (req.keyword or "").strip().lower()

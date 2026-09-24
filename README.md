@@ -38,7 +38,7 @@ make run                              # 或 bash scripts/run.sh
 curl http://127.0.0.1:9000/health     # → {"ok": true}
 ```
 
-跑测试（业务层 35 例单测，纯规则逻辑，**不需要模型权重**）：
+跑测试（业务层 81 例单测，纯规则逻辑，**不需要模型权重**）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -97,14 +97,15 @@ flowchart LR
 | `edge_runtime.py` / `embedding_runtime.py` | 端侧 LLM 与 embedding 的加载、推理 |
 | `cloud_client.py` | 云端 OpenAI 兼容接口客户端 |
 | `personal_search/` | 文件搜索业务线：service（检索/消歧/动作）、ingest（扫描/增量/清理）、vector_index（FAISS）、storage（JSONL）、schemas |
-| `expense/` | 报销业务线：service（抽取/检索/导出）、ingest（watch 目录）、storage、schemas |
+| `expense/` | 报销业务线：service（抽取/检索/导出/纠正）、ingest（watch 目录）、storage、schemas |
+| `analytics/` | 复盘指标：事件流存储（追加式 JSONL）+ 指标计算（口径见 [docs/METRICS.md](docs/METRICS.md)） |
 | `routers/` | chat / embeddings / expense / personal_search 四组路由 |
 | `web/` | Web UI（FastAPI 同源静态托管 `/web`，原生 JS 无构建；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
 | `text_utils.py` | 共享中英文分词器（两条业务线统一口径） |
 | `path_utils.py` | WSL 检测 + /mnt/c → C:\ 路径映射（open 动作回传 Windows 路径） |
 | `scripts/wsl_sources.sh` | WSL 文件索引源目录配置助手（探测 Windows 常见目录多选写入 .env） |
 | `scripts/macos_sources.sh` | macOS 源目录配置助手（含 IM 沙盒/iCloud 探测与 TCC 可读性检测） |
-| `tests/` | 业务层单测（35 例） |
+| `tests/` | 业务层单测（81 例） |
 | `android/` | Android MVP 客户端（Kotlin + Compose，见 [android/README.md](android/README.md)） |
 
 ---
@@ -122,10 +123,12 @@ flowchart LR
 | `POST /v1/expense/search` | 报销找回来：关键词 + 金额/日期/类型过滤 |
 | `POST /v1/expense/export` | 报销拿出去：生成可提交的材料清单 |
 | `POST /v1/expense/rebuild-index` | 手动触发 watch 目录扫描 |
+| `POST /v1/expense/correct` | 人工纠正抽取字段（金额/日期/商户/标题），计入复盘指标 |
 | `POST /v1/search-agent/search` | 文件搜索首查（返回状态机 + 候选 + 追问话术） |
 | `POST /v1/search-agent/clarify` | 追问消歧（时间/来源/字面线索均可） |
 | `POST /v1/search-agent/execute` | 命中动作：open / share / compare / annotate / archive |
 | `POST /v1/search-agent/rebuild-index` | 手动重建文件索引 |
+| `GET /v1/metrics` | 复盘指标（报销回访/补齐/纠正 + 搜索追问收敛漏斗） |
 
 ---
 
@@ -148,11 +151,14 @@ flowchart LR
 
 ## 产品目标与复盘指标（V1）
 
-复盘只看「用户再次回来」：
+复盘只看「用户再次回来」，**采集已落地**（`analytics/` 模块 → 事件流 JSONL →
+`GET /v1/metrics` → Web UI「📈 复盘」Tab；精确口径与已知偏差见
+[docs/METRICS.md](docs/METRICS.md)）：
 
 - **报销**：同一 `claim_id` 14 天内再次 search/export 的占比；收集后 1 小时内补齐
-  材料的成功率；自动抽取字段的纠正次数（越少越好）
-- **文件搜索**：追问后最终 resolved 并执行动作的会话占比（口径待定，暂无采集代码）
+  材料的成功率；自动抽取字段的纠正次数（经 `POST /v1/expense/correct`，越少越好）
+- **文件搜索**：追问后最终 resolved 并执行动作的会话占比（比率分母为 0 时返回
+  null"样本不足"，不以 0.0 冒充）
 
 ---
 
@@ -173,12 +179,14 @@ flowchart LR
 
 ```bash
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 35 例，无需模型权重
+pytest tests/                          # 81 例，无需模型权重
 ```
 
-覆盖：共享分词、时间线索匹配、状态判定、澄清重排收敛（回归：reply 可翻盘、
-分值不越界）、回复过滤（时间/来源线索）、报销字段抽取（金额/日期/商户）、
-JSONL 存储往返与容错、增量扫描生命周期（导入/跳过/变更重导/删除清理）。
+覆盖：共享分词（jieba 口径与无 jieba 降级口径）、时间线索匹配、状态判定、
+澄清重排收敛（回归：reply 可翻盘、分值不越界）、回复过滤（时间/来源线索）、
+报销字段抽取（金额/日期/商户）、JSONL 存储往返与容错、增量扫描生命周期
+（导入/跳过/变更重导/删除清理）、多根源目录与排除剪枝（WSL/macOS 索引层）、
+WSL 路径映射。
 
 ---
 
@@ -205,6 +213,7 @@ JSONL 存储往返与容错、增量扫描生命周期（导入/跳过/变更重
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | 安装、权重下载、启动、云端启用、FAQ |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Linux 服务器部署：一键脚本、systemd、服务管理、排错 |
 | [docs/WEB_UI.md](docs/WEB_UI.md) | Web 页面功能说明与 WSL 部署（localhost 转发 / 镜像网络 / systemd） |
+| [docs/METRICS.md](docs/METRICS.md) | 复盘指标口径：分子/分母/窗口/边界与已知偏差 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 端云路由架构、文件职责、设计要点 |
 | [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md) | 业务层两条线的机制细节与遗留清单 |
 | [docs/API.md](docs/API.md) | 全部接口的请求/响应示例 + 日志字典 |

@@ -3,6 +3,7 @@
 import pytest
 
 from edge_cloud_agent.config import ExpenseConfig
+from edge_cloud_agent.expense.schemas import ExpenseCorrectRequest
 from edge_cloud_agent.expense.service import ExpenseService
 from edge_cloud_agent.expense.storage import ExpenseMaterial, ExpenseStore
 
@@ -113,3 +114,30 @@ def test_collect_fills_extracted_fields(service):
     assert material.extracted_date == "2026-09-01"
     assert material.merchant == "京东"
     assert service.store.get(material.material_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# 字段纠正（复盘指标「纠正次数」的数据来源）
+# ---------------------------------------------------------------------------
+
+def test_correct_updates_changed_fields_only(service):
+    service.store.add_or_update(_make_material(extracted_amount=128.0, merchant="京东"))
+    req = ExpenseCorrectRequest(material_id="m1", extracted_amount=130.5)
+    material, changed = service.correct(req)
+    assert changed == ["extracted_amount"]
+    assert material.extracted_amount == 130.5
+    assert material.merchant == "京东", "未传字段应保持原值"
+    assert service.store.get("m1").extracted_amount == 130.5, "纠正应已落盘"
+
+
+def test_correct_noop_returns_empty_changed(service):
+    """传值与现值一致：无改动，不应计入纠正次数。"""
+
+    service.store.add_or_update(_make_material(extracted_amount=128.0))
+    _, changed = service.correct(ExpenseCorrectRequest(material_id="m1", extracted_amount=128.0))
+    assert changed == []
+
+
+def test_correct_unknown_material_raises(service):
+    with pytest.raises(KeyError):
+        service.correct(ExpenseCorrectRequest(material_id="nope"))

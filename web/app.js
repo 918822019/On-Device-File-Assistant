@@ -84,6 +84,7 @@ $("#tabs").addEventListener("click", (ev) => {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === btn));
   document.querySelectorAll(".tab-panel").forEach((p) =>
     p.classList.toggle("active", p.id === "tab-" + btn.dataset.tab));
+  if (btn.dataset.tab === "metrics") loadMetrics();
 });
 
 // ================================================================ 文件搜索
@@ -440,7 +441,40 @@ $("#collect-form").addEventListener("submit", async (ev) => {
         </div>
         <div class="muted">本单已 ${r.claim_material_count} 件 · 总额 ${r.claim_total_amount != null ? "¥" + r.claim_total_amount : "—"}</div>
         ${missing.length ? `<div style="margin-top:6px">⚠️ 还缺: ${missing.map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>` : ""}
+        <div class="kv" style="margin-top:8px">
+          <button type="button" class="btn btn-ghost btn-sm" id="toggle-correct">✏️ 纠正字段</button>
+          <span class="muted">抽取有误时人工修正，计入复盘「纠正次数」</span>
+        </div>
+        <form id="correct-form" class="form-grid hidden">
+          <label>金额<input name="extracted_amount" type="number" step="0.01" min="0" value="${r.extracted_amount ?? ""}"></label>
+          <label>日期<input name="extracted_date" type="text" value="${esc(r.extracted_date || "")}" placeholder="YYYY-MM-DD"></label>
+          <label>商户<input name="merchant" type="text" value="${esc(r.merchant || "")}"></label>
+          <label>标题<input name="title" type="text" value="${esc(r.title || "")}"></label>
+          <div class="span-2"><button type="submit" class="btn btn-primary btn-sm">提交纠正</button></div>
+        </form>
       </div>`;
+    $("#toggle-correct")?.addEventListener("click", () =>
+      $("#correct-form").classList.toggle("hidden"));
+    $("#correct-form")?.addEventListener("submit", async (ev2) => {
+      ev2.preventDefault();
+      const fd = new FormData(ev2.target);
+      const body = { material_id: r.material_id };
+      const amt = fd.get("extracted_amount");
+      if (amt !== null && String(amt).trim() !== "") body.extracted_amount = Number(amt);
+      for (const k of ["extracted_date", "merchant", "title"]) {
+        const v = fd.get(k);
+        if (v && String(v).trim() !== "") body[k] = String(v).trim();
+      }
+      try {
+        const cr = await api("/v1/expense/correct", body);
+        toast(cr.corrected_fields.length
+          ? `已纠正: ${cr.corrected_fields.join(", ")}`
+          : "传值与现值一致，无字段变化（不计数）", "ok");
+        $("#correct-form").classList.add("hidden");
+      } catch (e3) {
+        toast("纠正失败: " + e3.message, "err");
+      }
+    });
     toast("材料已收进来", "ok");
   } catch (e) { toast("collect 失败: " + e.message, "err"); }
 });
@@ -510,3 +544,51 @@ $("#rebuild-expense-btn").addEventListener("click", async (ev) => {
     busy(btn, false);
   }
 });
+
+// ================================================================ 复盘指标
+function pct(v) {
+  return v == null ? '<span class="muted">样本不足</span>' : (v * 100).toFixed(1) + "%";
+}
+
+function metricCard(label, value, sub) {
+  return `<div class="metric-card">
+    <div class="metric-label">${esc(label)}</div>
+    <div class="metric-value">${value}</div>
+    <div class="metric-sub">${sub}</div>
+  </div>`;
+}
+
+async function loadMetrics() {
+  const body = $("#metrics-body");
+  try {
+    const resp = await fetch(API_BASE + "/v1/metrics");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const d = await resp.json();
+    const e = d.expense || {}, f = d.file_search || {};
+    body.innerHTML = `
+      <h4 class="metrics-group">🧾 报销</h4>
+      <div class="metrics-grid">
+        ${metricCard("14 天回访率", pct(e.revisit_rate),
+          `${e.claims_revisited ?? 0}/${e.claims_total ?? 0} 个报销单 · 窗口 ${e.revisit_window_days ?? 14} 天`)}
+        ${metricCard("1 小时补齐率", pct(e.followup_completion_rate),
+          `${e.followup_completed ?? 0}/${e.followup_needed_claims ?? 0} 个缺件单 · 窗口 ${e.followup_window_hours ?? 1}h`)}
+        ${metricCard("字段纠正次数", e.corrections_total ?? 0,
+          `涉及 ${e.corrected_materials ?? 0} 件材料 · 越少越好`)}
+      </div>
+      <h4 class="metrics-group">🔍 文件搜索</h4>
+      <div class="metrics-grid">
+        ${metricCard("追问收敛率", pct(f.clarify_resolve_rate),
+          `${f.clarify_resolved ?? 0}/${f.needs_clarification ?? 0} 个追问会话最终 resolved`)}
+        ${metricCard("收敛且执行动作", pct(f.clarify_exec_rate),
+          `${f.clarify_resolved_executed ?? 0}/${f.needs_clarification ?? 0} · README 口径`)}
+        ${metricCard("会话总量", f.sessions_total ?? 0,
+          `直接命中 ${f.resolved_direct ?? 0} · 需追问 ${f.needs_clarification ?? 0} · 未找到 ${f.not_found ?? 0}`)}
+      </div>`;
+    $("#metrics-meta").textContent =
+      `事件流共 ${d.events_total ?? 0} 条 · 生成于 ${d.generated_at || "—"}（比率分母为 0 时显示"样本不足"，不以 0% 冒充）`;
+  } catch (e2) {
+    body.innerHTML = `<div class="muted">指标加载失败: ${esc(e2.message)}（指标服务未装配时返回 503）</div>`;
+  }
+}
+
+$("#metrics-refresh").addEventListener("click", loadMetrics);

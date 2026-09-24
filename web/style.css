@@ -193,6 +193,19 @@ pre.manifest {
   padding: 12px; font-size: 12px; overflow: auto; max-height: 320px; white-space: pre-wrap;
 }
 
+/* ---------- 复盘指标 ---------- */
+.metrics-group { margin: 14px 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
+.metrics-group:first-child { margin-top: 4px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+@media (max-width: 860px) { .metrics-grid { grid-template-columns: 1fr; } }
+.metric-card {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px;
+}
+.metric-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.metric-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); }
+.metric-sub { color: var(--muted); font-size: 11px; margin-top: 6px; }
+
 /* ---------- Toast ---------- */
 #toast-host { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
 .toast {

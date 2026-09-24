@@ -166,3 +166,13 @@ class PersonalFileConfig:
     faiss_semantic_weight: float = _env_float("FILE_MEMORY_FAISS_SEMANTIC_WEIGHT", 0.30)
     faiss_clue_weight: float = _env_float("FILE_MEMORY_FAISS_CLUE_WEIGHT", 0.25)
     faiss_version_bonus: float = _env_float("FILE_MEMORY_FAISS_VERSION_BONUS", 0.20)
+
+
+@dataclass(frozen=True)
+class MetricsConfig:
+    """复盘指标采集（README「产品目标与复盘指标」的落地，口径见 docs/METRICS.md）。"""
+
+    # 事件流为追加式 JSONL，与业务数据分离，删除该文件即重置指标
+    store_path: str = os.getenv("METRICS_STORE_PATH", "data/metrics_events.jsonl")
+    revisit_window_days: int = _env_int("METRICS_REVISIT_WINDOW_DAYS", 14)
+    followup_window_hours: int = _env_int("METRICS_FOLLOWUP_WINDOW_HOURS", 1)

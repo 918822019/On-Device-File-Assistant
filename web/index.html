@@ -25,6 +25,7 @@
   <button class="tab active" data-tab="search">🔍 文件搜索</button>
   <button class="tab" data-tab="chat">💬 端云聊天</button>
   <button class="tab" data-tab="expense">🧾 报销材料</button>
+  <button class="tab" data-tab="metrics">📈 复盘</button>
 </nav>
 
 <main>
@@ -133,6 +134,17 @@
         </form>
         <div id="export-result"></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ==================== 复盘指标 ==================== -->
+  <section id="tab-metrics" class="tab-panel">
+    <div class="panel">
+      <h3>📈 复盘指标 <span class="muted">/v1/metrics · V1 目标只看「用户再次回来」</span>
+        <button id="metrics-refresh" class="btn btn-ghost btn-sm">刷新</button>
+      </h3>
+      <div id="metrics-body"><div class="muted">加载中…</div></div>
+      <div class="hint-line" id="metrics-meta"></div>
     </div>
   </section>
 </main>

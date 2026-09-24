@@ -162,19 +162,23 @@ reply ─► _filter_candidates_by_reply 三路保留:
 
 | 模块 | 说明 |
 |---|---|
-| [text_utils.py](../src/edge_cloud_agent/text_utils.py) | 中英混合切词 + 中文标点分隔 + ≥2 字中文短语提取，两条业务线统一口径 |
+| [text_utils.py](../src/edge_cloud_agent/text_utils.py) | 中英混合切词：标点分隔 + jieba 搜索引擎模式细分（可选依赖，缺失时降级为 ≥2 字中文短语提取的旧口径），两条业务线统一 |
 | embedding_runtime | `embeddinggemma-300m`；**不可用时全链路自动降级**为纯规则打分（FAISS 回退全量扫描、语义分归零），业务不中断 |
 | 存储模式 | 内存 dict + JSONL 快照；个人文件侧支持批量写（`persist=False`+`flush`）；全部 tmp + `os.replace` 原子落盘 |
-| 配置 | `PersonalFileConfig` / `ExpenseConfig`，全环境变量驱动，权重/阈值可调 |
+| [analytics/](../src/edge_cloud_agent/analytics/) | 复盘指标：路由埋点（`record_safe` 失败保护）→ 追加式 JSONL 事件流 → `GET /v1/metrics`；口径见 [METRICS.md](METRICS.md) |
+| 配置 | `PersonalFileConfig` / `ExpenseConfig` / `MetricsConfig`，全环境变量驱动，权重/阈值可调 |
 | 测试 | `tests/` 35 例：分词/时间线索/状态判定/重排收敛/过滤线索/字段抽取/存储往返/增量扫描生命周期 |
 
 ---
 
 ## 四、当前边界与遗留（按影响排序）
 
-1. **无中文分词**：长查询（如"上周群里发的聚餐照片"）整体是一个 token，
-   文本路命中靠子串匹配常为 0，实际靠线索分支撑。接入 jieba 或端侧小模型
-   分词是下一个提升点。
+1. ~~**无中文分词**：长查询（如"上周群里发的聚餐照片"）整体是一个 token，
+   文本路命中靠子串匹配常为 0，实际靠线索分支撑~~ ✅ 已修复（2026-09，M0）：
+   `text_utils.tokenize` 接入 jieba 搜索引擎模式（可选依赖，缺失自动降级为
+   旧纯规则口径）；单字虚词过滤；整句精确命中由打分端 +1.5 加成承接，
+   不再保留切不开的整段长 token。实测同一长查询文本路 0/1 → 4/4 命中，
+   头候选 0.854 直接 resolved（此前需追问轮收敛）。
 2. ~~**`"v" in haystack` 版本加分过松**~~ ✅ 已修复：改为 `_VERSION_MARK_RE`
    正则（`(?<![a-z0-9])v\d+` 或"版本"字样），且仅在查询带版本意图时才加分。
 3. ~~**会话/备注/归档不持久化、无过期淘汰**~~ ✅ 已修复：备注/归档落盘

@@ -20,11 +20,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse
 
 from .agent import EdgeCloudOrchestrator
+from .analytics.service import MetricsService
+from .analytics.storage import MetricsEventStore
 from .config import (
     CloudConfig,
     EdgeConfig,
     EmbeddingConfig,
     ExpenseConfig,
+    MetricsConfig,
     PersonalFileConfig,
     RouteConfig,
 )
@@ -36,6 +39,7 @@ from .personal_search.storage import PersonalFileStore
 from .routers.chat import router as chat_router
 from .routers.embeddings import router as embeddings_router
 from .routers.expense import router as expense_router
+from .routers.metrics import router as metrics_router
 from .routers.personal_search import router as personal_search_router
 from .schemas import ErrorResponse
 from .expense.ingest import start_watch_loop
@@ -134,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(embeddings_router)
     app.include_router(expense_router)
     app.include_router(personal_search_router)
+    app.include_router(metrics_router)
 
     # Web UI：同源静态托管（repo/web/）。同源意味着零 CORS 配置；
     # WSL2 下 Windows 浏览器经 localhost 端口转发直达，见 docs/WEB_UI.md。
@@ -267,6 +272,19 @@ def create_app() -> FastAPI:
         app.state.route_cfg = RouteConfig()
         app.state.embedding_cfg = EmbeddingConfig()
         app.state.expense_cfg = ExpenseConfig()
+
+        # 复盘指标：装配失败不致命（埋点侧对 None 全部静默跳过）
+        app.state.metrics_cfg = MetricsConfig()
+        try:
+            app.state.metrics = MetricsService(
+                store=MetricsEventStore(app.state.metrics_cfg.store_path),
+                revisit_window_days=app.state.metrics_cfg.revisit_window_days,
+                followup_window_hours=app.state.metrics_cfg.followup_window_hours,
+            )
+            logger.info("Metrics service ready: %s", app.state.metrics_cfg.store_path)
+        except Exception as exc:  # pragma: no cover
+            app.state.metrics = None
+            logger.warning("Metrics service unavailable: %s", exc)
 
         app.state.orchestrator = EdgeCloudOrchestrator(
             app.state.edge_cfg,

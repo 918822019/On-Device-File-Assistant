@@ -15,6 +15,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from time import perf_counter
 
+from ..analytics import record_safe
 from ..config import PersonalFileConfig
 from ..path_utils import is_wsl, wsl_to_windows_path
 from ..personal_search.ingest import run_once
@@ -185,6 +186,15 @@ def search(req: FileSearchRequest, request: Request):
         },
     )
 
+    # 复盘埋点：会话首轮状态（追问收敛率漏斗的入口）
+    record_safe(
+        getattr(request.app.state, "metrics", None),
+        "record_search_state",
+        session_id,
+        state,
+        "search",
+    )
+
     return FileSearchResponse(
         query=req.query,
         session_id=session_id,
@@ -252,6 +262,15 @@ def clarify(req: FileSearchSessionRequest, request: Request):
         },
     )
 
+    # 复盘埋点：追问轮状态（任一轮 resolved 即计入收敛）
+    record_safe(
+        getattr(request.app.state, "metrics", None),
+        "record_search_state",
+        session_id,
+        state,
+        "clarify",
+    )
+
     return FileSearchResponse(
         query=original_query,
         session_id=session_id,
@@ -266,6 +285,24 @@ def clarify(req: FileSearchSessionRequest, request: Request):
 
 @router.post("/v1/search-agent/execute", response_model=FileActionResponse)
 def execute(req: FileActionRequest, request: Request):
+    """命中结果后的动作执行（复盘埋点包装层）。
+
+    动作逻辑在 _execute_impl；本层只负责把 (session_id, action, status)
+    记入指标事件流。HTTPException（400/404 等）不构成"执行动作"，不记录。
+    """
+
+    resp = _execute_impl(req, request)
+    record_safe(
+        getattr(request.app.state, "metrics", None),
+        "record_search_action",
+        req.session_id,
+        resp.action,
+        resp.status,
+    )
+    return resp
+
+
+def _execute_impl(req: FileActionRequest, request: Request) -> FileActionResponse:
     """命中结果后的动作执行。
 
 动作包括：open/share/annotate/archive/compare。

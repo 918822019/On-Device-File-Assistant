@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
+from ..analytics import record_safe
 from ..config import ExpenseConfig
 from ..expense.schemas import (
     ExpenseCollectRequest,
     ExpenseCollectResponse,
+    ExpenseCorrectRequest,
+    ExpenseCorrectResponse,
     ExpenseRebuildIndexResponse,
     ExpenseExportRequest,
     ExpenseExportResponse,
@@ -45,6 +48,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
+def _record(request: Request, method_name: str, *args) -> None:
+    """复盘指标埋点：服务未装配或记录失败都静默跳过，绝不影响业务响应。"""
+
+    record_safe(getattr(request.app.state, "metrics", None), method_name, *args)
+
+
 @router.post("/v1/expense/collect", response_model=ExpenseCollectResponse)
 def collect(req: ExpenseCollectRequest, request: Request):
     service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
@@ -60,6 +69,14 @@ def collect(req: ExpenseCollectRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"收集材料失败: {exc}") from exc
 
     claim_total, claim_count, missing_types = service.build_claim_summary(claim_id=material.claim_id)
+    _record(
+        request,
+        "record_expense_collect",
+        material.claim_id,
+        material.material_id,
+        bool(missing_types),
+        missing_types,
+    )
     return ExpenseCollectResponse(
         material_id=material.material_id,
         claim_id=material.claim_id,
@@ -106,6 +123,7 @@ def search(req: ExpenseSearchRequest, request: Request):
     missing_types: list[str] = []
     if req.claim_id:
         _, _, missing_types = service.build_claim_summary(req.claim_id)
+    _record(request, "record_expense_search", req.claim_id)
     return ExpenseSearchResponse(
         keyword=req.keyword,
         claim_id=req.claim_id,
@@ -140,6 +158,7 @@ def export(req: ExpenseExportRequest, request: Request):
     if not claim_id and materials:
         claim_id = materials[0].claim_id
 
+    _record(request, "record_expense_export", claim_id, len(materials))
     return ExpenseExportResponse(
         export_id=export_id,
         claim_id=claim_id,
@@ -149,6 +168,34 @@ def export(req: ExpenseExportRequest, request: Request):
         export_time=_now_iso(),
         manifest=manifest,
         materials=[_build_export_material(material) for material in materials],
+    )
+
+
+@router.post("/v1/expense/correct", response_model=ExpenseCorrectResponse)
+def correct(req: ExpenseCorrectRequest, request: Request):
+    """人工纠正抽取字段；实际改动计入复盘指标「字段纠正次数」。"""
+
+    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    try:
+        material, changed = service.correct(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="材料不存在") from exc
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"纠正失败: {exc}") from exc
+
+    if changed:
+        _record(request, "record_expense_correct", material.claim_id, material.material_id, changed)
+    return ExpenseCorrectResponse(
+        material_id=material.material_id,
+        claim_id=material.claim_id,
+        corrected_fields=changed,
+        title=material.title,
+        extracted_amount=material.extracted_amount,
+        extracted_date=material.extracted_date,
+        merchant=material.merchant,
+        updated_at=material.updated_at,
     )
 
 

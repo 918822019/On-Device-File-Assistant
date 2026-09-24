@@ -112,3 +112,28 @@ class ExpenseRebuildIndexResponse(BaseModel):
     errors: int = 0
     removed: int = 0
     material_ids: list[str] = Field(default_factory=list)
+
+
+class ExpenseCorrectRequest(BaseModel):
+    """字段纠正：只传要改的字段，None = 不改（MVP 不支持把已有值清空）。
+
+    纠正对象是抽取结果展示字段；raw_text / embedding 不动。
+    实际发生改动的调用会计入复盘指标「字段纠正次数」（越少越好）。
+    """
+
+    material_id: str = Field(..., min_length=1)
+    extracted_amount: float | None = Field(default=None, ge=0)
+    extracted_date: str | None = None
+    merchant: str | None = None
+    title: str | None = None
+
+
+class ExpenseCorrectResponse(BaseModel):
+    material_id: str
+    claim_id: str
+    corrected_fields: list[str] = Field(default_factory=list)
+    title: str
+    extracted_amount: float | None = None
+    extracted_date: str | None = None
+    merchant: str | None = None
+    updated_at: str = ""
