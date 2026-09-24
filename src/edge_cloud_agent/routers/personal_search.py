@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from time import perf_counter
 
 from ..config import PersonalFileConfig
+from ..path_utils import is_wsl, wsl_to_windows_path
 from ..personal_search.ingest import run_once
 from ..personal_search.schemas import (
     FileActionRequest,
@@ -324,12 +325,18 @@ def execute(req: FileActionRequest, request: Request):
                 annotations=service.get_annotation(req.file_id),
                 next_action_suggestions=["分享", "加备注", "归档"],
             )
+        # WSL 部署：file:///mnt/c/... 对 Windows 浏览器无意义，附带映射后的
+        # Windows 路径（C:\...）供前端展示/复制。非 WSL 环境为 None，行为不变。
+        windows_path = (
+            wsl_to_windows_path(file_item.file_path) if is_wsl() else None
+        )
         _LOGGER.info(
             "personal-search-api-execute-open-ok",
             extra={
                 "event": "api.execute.open_ok",
                 "trace_id": request_trace_id,
                 "file_id": req.file_id,
+                "windows_path_mapped": windows_path is not None,
                 "duration_ms": round((perf_counter() - started) * 1000, 2),
                 "path": "/v1/search-agent/execute",
             },
@@ -340,6 +347,7 @@ def execute(req: FileActionRequest, request: Request):
             file_id=req.file_id,
             file_title=file_item.title,
             file_uri=file_item.file_uri,
+            windows_path=windows_path,
             message=f"已定位到原件：{file_item.title}",
             archived=service.is_archived(req.file_id),
             annotations=service.get_annotation(req.file_id),

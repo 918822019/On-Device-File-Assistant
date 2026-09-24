@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from hashlib import md5
 from pathlib import Path
@@ -61,23 +62,62 @@ def _normalize_root_suffix_set(cfg: PersonalFileConfig) -> set[str]:
     return suffixes
 
 
-def _discover_files(cfg: PersonalFileConfig) -> list[Path]:
-    """遍历 source_dir，返回满足后缀过滤的文件清单。"""
+def source_roots(cfg: PersonalFileConfig) -> list[Path]:
+    """解析多根源目录：逗号分隔，expanduser + resolve，去重保序。
 
-    source_dir = Path(cfg.source_dir).expanduser().resolve()
-    if not source_dir.exists() or not source_dir.is_dir():
-        return []
+    WSL 部署下 Windows 侧文件天然分散（Desktop/Downloads/Pictures/微信目录），
+    单根不够用；单根配置是本函数的退化情形，行为不变。
+    """
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for chunk in (cfg.source_dir or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        path = Path(chunk).expanduser().resolve()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(path)
+    return roots
+
+
+def _exclude_dir_names(cfg: PersonalFileConfig) -> set[str]:
+    return {c.strip().lower() for c in (cfg.scan_exclude_dirs or "").split(",") if c.strip()}
+
+
+def _discover_files(cfg: PersonalFileConfig) -> list[Path]:
+    """遍历全部源根目录，返回满足后缀过滤的文件清单（排除目录剪枝）。"""
 
     suffix_set = _normalize_root_suffix_set(cfg)
-    iterator = source_dir.rglob("*") if cfg.scan_recursive else source_dir.iterdir()
+    excludes = _exclude_dir_names(cfg)
 
     files: list[Path] = []
-    for item in iterator:
-        if not item.is_file():
+    for root in source_roots(cfg):
+        if not root.is_dir():
             continue
-        if item.suffix.lower() not in suffix_set:
+        if not cfg.scan_recursive:
+            try:
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for item in entries:
+                if item.is_file() and item.suffix.lower() in suffix_set:
+                    files.append(item)
             continue
-        files.append(item)
+        # os.walk + 原地剪枝。此前用 rglob("*")：无法跳过整棵子树，WSL 下
+        # 跨 9P 扫 /mnt/c 时 node_modules/AppData 级目录会让扫描成本爆炸。
+        # followlinks=False 防符号链接环。
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            if excludes:
+                dirnames[:] = [d for d in dirnames if d.lower() not in excludes]
+            for name in filenames:
+                path = Path(dirpath) / name
+                if path.suffix.lower() in suffix_set:
+                    files.append(path)
+    files.sort()
     return files
 
 
@@ -204,23 +244,45 @@ def _build_item(service: PersonalFileSearchService, cfg: PersonalFileConfig, pat
     )
 
 
-def _sweep_deleted_files(service: PersonalFileSearchService, cfg: PersonalFileConfig) -> int:
-    """清理磁盘上已被删除、但索引里仍存在的幽灵记录。
+def _owning_root(path: Path, roots: list[Path]) -> Path | None:
+    """返回 path 所属的源根目录（不在任何根下时返回 None）。"""
 
-    仅在 source_dir 目录本身仍存在时执行：目录未挂载/暂不可达时全量扫描
-    会得到空列表，此时清索引会误删全部数据。删除只改内存，落盘由调用方
-    统一 flush。
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    return None
+
+
+def _sweep_deleted_files(service: PersonalFileSearchService, cfg: PersonalFileConfig) -> int:
+    """清理磁盘上已被删除、但索引里仍存在的幽灵记录（多根按根保护）。
+
+    防误删语义从「单根可达」推广为「按根可达」：
+    - 全部根不可达 → 完全不清理（原保护逻辑）；
+    - 记录归属的根暂不可达（如 /mnt/c 未就绪）→ 保留该记录；
+    - 记录归属的根可达但文件已不存在，或记录不属于任何配置根
+      （源目录被移出配置的历史残留）→ 清理。
+    删除只改内存，落盘由调用方统一 flush。
     """
 
-    source_root = Path(cfg.source_dir).expanduser().resolve()
-    if not source_root.is_dir():
+    roots = source_roots(cfg)
+    if not roots:
+        return 0
+    reachable = {str(r) for r in roots if r.is_dir()}
+    if not reachable:
         return 0
 
     removed = 0
     for item in service.store.list_all():
         if not item.file_path:
             continue
-        if Path(item.file_path).exists():
+        path = Path(item.file_path)
+        if path.exists():
+            continue
+        owner = _owning_root(path, roots)
+        if owner is not None and str(owner) not in reachable:
             continue
         service.store.delete_by_file_uri(item.file_uri, persist=False)
         removed += 1

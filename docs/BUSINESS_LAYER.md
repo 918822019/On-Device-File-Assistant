@@ -45,7 +45,7 @@
 三个触发入口: 后台watch线程(scan_interval) │ /search节流异步刷新(窗口内≤1次,不阻塞请求) │ rebuild-index
                     │  (_SCAN_LOCK 全局串行)
                     ▼
-     扫描 source_dir(后缀白名单) ─► hash/size 判重【前置】─未变─► skip(不读内容/不算embedding)
+     扫描多根 source_dir(逗号分隔;后缀白名单+排除目录剪枝) ─► hash/size 判重【前置】─未变─► skip(不读内容/不算embedding)
                     │新增/变更
                     ▼
      构建 item: captured_at=文件mtime │ summary(110字) │ tags │ visual_hints
@@ -53,7 +53,7 @@
                     ▼
      JSONL 批量落盘(persist=False + flush, 原子写) ─► FAISS 全量重建(IndexFlatIP, 768维)
                     ▼
-     幽灵清理: 磁盘已删的文件移出索引(source_dir 不可达时拒绝清理, 防误删全库)
+     幽灵清理: 磁盘已删的文件移出索引(按根保护: 某根不可达时保留其记录, 防误删)
 ```
 
 要点：
@@ -61,6 +61,11 @@
 - **captured_at 取文件 mtime**，不是扫描时刻——时间线索检索的锚点。
 - **判重前置**：未变更文件不重读内容、不重算 embedding（watch 周期成本控制的关键）。
 - **/search 不再同步扫描**：请求路径只做节流异步触发，首查延迟与文件量解耦。
+- **多根源目录**（WSL 场景）：`FILE_MEMORY_SOURCE_DIR` 逗号分隔多根，遍历用
+  os.walk + `FILE_MEMORY_SCAN_EXCLUDE_DIRS` 整棵剪枝（跨 9P 扫 /mnt/c 的成本控制）；
+  配置助手 `scripts/wsl_sources.sh`。open 动作在 WSL 下附带 `windows_path`
+  （/mnt/c → C:\ 映射，`path_utils.py`），Web UI 可复制。详见
+  [WEB_UI.md](WEB_UI.md)「WSL 文件索引层」。
 
 ### 1.3 检索打分（`_score_item`）
 

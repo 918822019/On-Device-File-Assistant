@@ -106,3 +106,137 @@ def test_sweep_skipped_when_source_dir_missing(tmp_path):
     result = run_once(service, cfg)
     assert result.scanned == 0
     assert result.removed == 0
+
+
+# ---------------- WSL 文件索引层：多根 / 剪枝 / 按根保护 ----------------
+
+
+def _make_service(tmp_path, source_dir: str, name: str = "multi"):
+    cfg = PersonalFileConfig(
+        store_path=str(tmp_path / f"{name}_store.jsonl"),
+        state_path=str(tmp_path / f"{name}_state.json"),
+        source_dir=source_dir,
+        faiss_index_path=str(tmp_path / f"{name}_idx.index"),
+        enable_faiss=False,
+    )
+    service = PersonalFileSearchService(
+        config=cfg,
+        store=PersonalFileStore(cfg.store_path),
+        embedding_runtime=None,
+    )
+    return cfg, service
+
+
+def test_multi_root_scan_imports_from_all_roots(tmp_path):
+    """FILE_MEMORY_SOURCE_DIR 逗号分隔多根：两个根下的文件都要入库。"""
+
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    (root_a / "桌面笔记.txt").write_text("desktop note", encoding="utf-8")
+    (root_b / "下载发票.txt").write_text("invoice from downloads", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, f"{root_a},{root_b}")
+    result = run_once(service, cfg)
+    assert (result.scanned, result.imported, result.errors) == (2, 2, 0)
+    titles = {item.title for item in service.store.list_all()}
+    assert titles == {"桌面笔记", "下载发票"}
+
+
+def test_multi_root_dedupe_and_blank_chunks(tmp_path):
+    """重复根去重；首尾多余逗号/空格不影响解析。"""
+
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    (root_a / "only.txt").write_text("single root repeated", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, f" , {root_a} , {root_a}, ")
+    result = run_once(service, cfg)
+    assert (result.scanned, result.imported) == (1, 1)
+
+
+def test_exclude_dirs_pruned(tmp_path):
+    """排除目录整棵剪枝：node_modules 下的文件不进扫描面。"""
+
+    root = tmp_path / "root"
+    (root / "node_modules" / "dep").mkdir(parents=True)
+    (root / ".git").mkdir()
+    (root / "node_modules" / "dep" / "lib.txt").write_text("junk", encoding="utf-8")
+    (root / ".git" / "config.txt").write_text("junk", encoding="utf-8")
+    (root / "keep.txt").write_text("real content", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, str(root))
+    result = run_once(service, cfg)
+    assert result.scanned == 1
+    assert result.imported == 1
+    assert service.store.list_all()[0].title == "keep"
+
+
+def test_exclude_dirs_can_be_disabled(tmp_path):
+    """FILE_MEMORY_SCAN_EXCLUDE_DIRS 置空 = 关闭剪枝。"""
+
+    root = tmp_path / "root"
+    (root / "node_modules").mkdir(parents=True)
+    (root / "node_modules" / "lib.txt").write_text("junk", encoding="utf-8")
+
+    cfg = PersonalFileConfig(
+        store_path=str(tmp_path / "s.jsonl"),
+        state_path=str(tmp_path / "st.json"),
+        source_dir=str(root),
+        scan_exclude_dirs="",
+        enable_faiss=False,
+    )
+    service = PersonalFileSearchService(
+        config=cfg, store=PersonalFileStore(cfg.store_path), embedding_runtime=None
+    )
+    result = run_once(service, cfg)
+    assert result.scanned == 1
+
+
+def test_sweep_per_root_protection(tmp_path):
+    """按根保护：不可达根（如 /mnt/c 未挂载）下的记录保留，可达根下的幽灵清理。"""
+
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    root_a.mkdir()
+    root_b.mkdir()
+    file_a = root_a / "a.txt"
+    file_b = root_b / "b.txt"
+    file_a.write_text("content a", encoding="utf-8")
+    file_b.write_text("content b", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, f"{root_a},{root_b}")
+    run_once(service, cfg)
+    assert len(service.store.list_all()) == 2
+
+    # 模拟：B 根整个不可达（未挂载），同时 A 根下文件被删除
+    root_b.rename(tmp_path / "b_unmounted")
+    file_a.unlink()
+    result = run_once(service, cfg)
+
+    assert result.removed == 1, "只清 A 根下的幽灵，B 根不可达须保留"
+    remaining = service.store.list_all()
+    assert len(remaining) == 1
+    assert remaining[0].title == "b"
+
+    # B 根恢复可达后，b.txt 仍在磁盘 → 记录继续保留且判重跳过
+    (tmp_path / "b_unmounted").rename(root_b)
+    result2 = run_once(service, cfg)
+    assert (result2.imported, result2.removed, result2.skipped) == (0, 0, 1)
+
+
+def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):
+    """全部根不可达时完全不清理（原单根保护语义的多根推广）。"""
+
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    (root_a / "a.txt").write_text("content", encoding="utf-8")
+    cfg, service = _make_service(tmp_path, str(root_a))
+    run_once(service, cfg)
+    assert len(service.store.list_all()) == 1
+
+    root_a.rename(tmp_path / "a_gone")
+    result = run_once(service, cfg)
+    assert result.removed == 0
+    assert len(service.store.list_all()) == 1

@@ -91,6 +91,9 @@ class FileActionResponse(BaseModel):
     file_id: str
     file_title: str | None = None
     file_uri: str | None = None
+    # WSL 部署专属：/mnt/c/... 映射出的 Windows 路径（C:\...），
+    # 供 Windows 侧浏览器用户复制/在资源管理器打开；非 WSL 或非挂载路径为 null
+    windows_path: str | None = None
     message: str
     share_payload: dict | None = None
     compare_payload: dict | None = None

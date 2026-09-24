@@ -83,11 +83,44 @@ New-NetFirewallRule -DisplayName "edge-cloud-agent" -Direction Inbound -LocalPor
 
 WSL IP 每次重启会变，方案 B 需要重新执行（可做成登录脚本）。
 
+### WSL 文件索引层：把 Windows 侧文件纳入索引
+
+后端在 WSL 里，但要搜的文件在 Windows 侧（桌面/下载/图片/微信目录）。
+索引层通过 `/mnt/c/...` 挂载路径直接覆盖它们，配置要点：
+
+**1. 多根源目录**——`FILE_MEMORY_SOURCE_DIR` 支持逗号分隔多个根（路径可含空格）：
+
+```bash
+# 交互式：探测 /mnt/c/Users/* 下常见目录（含 WeChat Files/xwechat_files/QQ 等），多选写入 .env
+bash scripts/wsl_sources.sh
+bash scripts/wsl_sources.sh --print          # 只预览候选不写入
+bash scripts/wsl_sources.sh /path/a /path/b  # 任意平台直接指定
+```
+
+**2. 排除目录剪枝**——跨 9P 扫描成本高，`FILE_MEMORY_SCAN_EXCLUDE_DIRS`
+（默认含 `.git/node_modules/.venv/__pycache__` 等）会在遍历中整棵剪掉命中目录；
+想跳过 AppData 大子树可自行追加。**不要把根目录直接设成 `/mnt/c/Users/<你>`**，
+应选具体子目录，否则首扫会遍历整个用户目录。
+
+**3. 性能预期**——首扫按文件量以分钟计（9P 单文件 stat/读 1MB hash 都比原生盘慢数倍）；
+之后 hash/size 判重前置，未变更文件不读内容，120s watch 周期的增量成本低。
+索引本体（`data/*.jsonl` + FAISS）在 WSL 文件系统内，不受 9P 影响。
+
+**4. 打开动作的路径映射**——`file:///mnt/c/...` 对 Windows 浏览器没有意义。
+WSL 环境下 open 动作会自动附带 `windows_path`（`C:\Users\...`），
+Web UI 在动作结果区展示并支持一键复制，粘到资源管理器地址栏即可打开。
+检测可用 `FILE_MEMORY_WSL_PATH_MAP=true/false` 强制覆盖。
+
+**5. 幽灵清理按根保护**——某个根暂不可达（如 `/mnt/c` 未就绪）时，
+属于它的索引记录不会被误删；只有可达根下确实消失的文件才被清理。
+
 ### 性能提示：权重放 WSL 文件系统内
 
 模型权重（`models/`，~11 GiB）务必放在 WSL 自己的文件系统（如 `~/端云结合/models/`），
 **不要放 `/mnt/c/...`**——跨文件系统 IO 会显著拖慢模型加载与 PLE 流式读取。
 仓库整体都建议 clone 在 WSL 内，Windows 侧用 IDE 的 WSL remote 连接开发。
+（注意与上一节区分：**源文件**本来就在 Windows 侧、必须经 /mnt/c 扫；
+这里说的只是**权重与仓库自身**不要放 /mnt/c。）
 
 ## 安全提醒
 

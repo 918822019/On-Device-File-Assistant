@@ -237,6 +237,11 @@ function showActionResult(r) {
       : esc(r.file_uri)}
       <button class="btn btn-ghost btn-sm" data-copy="${esc(r.file_uri)}">复制</button></div>`);
   }
+  if (r.windows_path) {
+    // WSL 后端：给出可在 Windows 资源管理器直接使用的路径
+    parts.push(`<div class="uri-line">🪟 Windows 路径: ${esc(r.windows_path)}
+      <button class="btn btn-ghost btn-sm" data-copy="${esc(r.windows_path)}">复制</button></div>`);
+  }
   if (r.annotations) parts.push(`<div>备注: ${esc(r.annotations)}</div>`);
   if (r.archived) parts.push(`<div><span class="badge badge-muted">已归档</span></div>`);
   if (r.share_payload) parts.push(`<pre>${esc(JSON.stringify(r.share_payload, null, 2))}</pre>`);

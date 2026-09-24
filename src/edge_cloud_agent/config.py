@@ -133,7 +133,15 @@ class PersonalFileConfig:
     store_path: str = os.getenv("FILE_MEMORY_STORE_PATH", "data/personal_file_store.jsonl")
     # 备注/归档标记的持久化文件（此前仅内存，重启即丢）
     state_path: str = os.getenv("FILE_MEMORY_STATE_PATH", "data/file_state.json")
+    # 多根源目录：逗号分隔（WSL 场景下 Windows 文件分散在 Desktop/Downloads/
+    # Pictures/微信目录等多处；路径本身可含空格，分隔符只认逗号）
     source_dir: str = os.getenv("FILE_MEMORY_SOURCE_DIR", "")
+    # 扫描时按目录名剪枝（大小写不敏感）。WSL 下跨 9P 扫 /mnt/c 成本高，
+    # 剪掉依赖/缓存/回收站目录是控制扫描面的关键；置空字符串可关闭剪枝。
+    scan_exclude_dirs: str = os.getenv(
+        "FILE_MEMORY_SCAN_EXCLUDE_DIRS",
+        ".git,node_modules,.venv,__pycache__,.cache,.Trash,.tmp,.idea,.pytest_cache,.gradle",
+    )
     scan_interval_seconds: int = _env_int("FILE_MEMORY_SCAN_INTERVAL_SECONDS", 120)
     scan_file_suffixes: str = os.getenv(
         "FILE_MEMORY_SCAN_FILE_SUFFIXES",
