@@ -15,3 +15,6 @@ bitsandbytes==0.42.0
 modelscope==1.20.0
 faiss-cpu==1.10.0
 numpy==2.3.2
+# 中文分词（text_utils.tokenize 的 M0 升级）：长查询不再退化成单个整 token。
+# 可选依赖：缺失时 tokenize 自动降级为纯规则口径，业务不中断。纯 Python，无原生依赖。
+jieba==0.42.1
