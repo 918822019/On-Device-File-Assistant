@@ -1,4 +1,4 @@
-# Web UI 使用说明（含 WSL 部署）
+# Web UI 使用说明（含 WSL / macOS 部署）
 
 Web 页面由 FastAPI **同源静态托管**（`web/` 目录挂在 `/web`，`/` 自动重定向），
 没有独立前端服务、没有构建步骤、没有 CORS 配置——服务起在哪，页面就在哪：
@@ -121,6 +121,36 @@ Web UI 在动作结果区展示并支持一键复制，粘到资源管理器地�
 仓库整体都建议 clone 在 WSL 内，Windows 侧用 IDE 的 WSL remote 连接开发。
 （注意与上一节区分：**源文件**本来就在 Windows 侧、必须经 /mnt/c 扫；
 这里说的只是**权重与仓库自身**不要放 /mnt/c。）
+
+## macOS 本机运行（开发机形态）
+
+后端直接跑在 macOS 上（`make run` 前台，或 `service.sh start` PID 托管），
+浏览器开 `http://localhost:9000/`。文件索引层的 macOS 要点：
+
+**1. 源目录配置**——用平台助手探测常见目录（含微信/QQ/企业微信/钉钉沙盒与
+iCloud Drive），多选写入 `.env`：
+
+```bash
+bash scripts/macos_sources.sh           # 交互选择（附 TCC 可读性检测）
+bash scripts/macos_sources.sh --print   # 只预览候选
+```
+
+**2. TCC 隐私权限（macOS 特有，最常踩的坑）**——未授权进程读
+`~/Desktop` / `~/Documents` / `~/Downloads` 会报 Operation not permitted，
+扫描静默得到空结果。到「系统设置 → 隐私与安全性 → **完全磁盘访问权限**」
+把**运行后端的那个 App**（Terminal / iTerm / PyCharm…）加进去，然后重启终端。
+助手脚本会对每个候选目录做可读性检测并标注 ⚠️。
+
+**3. iCloud Drive**——未下载到本地的文件是 `.icloud` 占位符，不在后缀白名单内，
+自然跳过、不会触发下载；已下载文件正常入库。iCloud 同步目录的频繁变更可能让
+watch 周期反复重算 hash，文件量大时可调大 `FILE_MEMORY_SCAN_INTERVAL_SECONDS`。
+
+**4. 不要把根设成 `$HOME`**——`~/Library` 子树极大会拖垮扫描，选具体子目录；
+外置卷（`/Volumes/...`）可以直接作为根，Spotlight/废纸篓等卷元数据目录已在
+默认排除清单里。
+
+**5. 打开动作**——`file://` URI 浏览器不允许从 http 页面跳转，Web UI 的
+「复制路径」按钮会给纯 POSIX 路径，粘到 Finder「前往文件夹」（⌘⇧G）直达。
 
 ## 安全提醒
 

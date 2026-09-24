@@ -53,7 +53,7 @@ _SOURCE_KEYWORDS = {
     "wechat": {"微信", "weixin", "wechat", "微信好友", "微信群", "群里", "群聊"},
     "email": {"邮箱", "email", "mail", "gmail", "outlook"},
     "gallery": {"图库", "相册", "gallery"},
-    "camera": {"拍照", "相机", "camera", "截图", "screenshot", "screen"},
+    "camera": {"拍照", "相机", "camera", "截图", "截屏", "screenshot", "screen"},
     "document": {"word", "excel", "ppt", "文档", "文件", "doc", "pdf"},
 }
 
@@ -216,7 +216,15 @@ def _infer_source_from_path(file_path: Path) -> str:
         return "email"
     if "image" in lowered or "images" in lowered or "图库" in lowered or "相册" in lowered:
         return "gallery"
-    if "camera" in lowered or "截图" in lowered or "screenshot" in lowered:
+    # "截屏" 为 macOS 中文系统截图文件名前缀（截屏2026-09-24 ….png）；
+    # "screen shot" 为旧版 macOS 英文命名（Screen Shot 2026-…），与 screenshot 并列。
+    if (
+        "camera" in lowered
+        or "截图" in lowered
+        or "截屏" in lowered
+        or "screenshot" in lowered
+        or "screen shot" in lowered
+    ):
         return "camera"
     return "local"
 

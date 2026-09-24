@@ -138,9 +138,12 @@ class PersonalFileConfig:
     source_dir: str = os.getenv("FILE_MEMORY_SOURCE_DIR", "")
     # 扫描时按目录名剪枝（大小写不敏感）。WSL 下跨 9P 扫 /mnt/c 成本高，
     # 剪掉依赖/缓存/回收站目录是控制扫描面的关键；置空字符串可关闭剪枝。
+    # 后半段为 macOS 卷元数据目录（Spotlight/fseventsd/废纸篓等），外置卷与
+    # iCloud 同步目录下常见，跨平台保留无害。
     scan_exclude_dirs: str = os.getenv(
         "FILE_MEMORY_SCAN_EXCLUDE_DIRS",
-        ".git,node_modules,.venv,__pycache__,.cache,.Trash,.tmp,.idea,.pytest_cache,.gradle",
+        ".git,node_modules,.venv,__pycache__,.cache,.Trash,.tmp,.idea,.pytest_cache,.gradle,"
+        ".Spotlight-V100,.fseventsd,.TemporaryItems,.DocumentRevisions-V100,.Trashes,.apdisk",
     )
     scan_interval_seconds: int = _env_int("FILE_MEMORY_SCAN_INTERVAL_SECONDS", 120)
     scan_file_suffixes: str = os.getenv(

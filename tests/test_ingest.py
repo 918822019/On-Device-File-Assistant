@@ -3,12 +3,16 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from edge_cloud_agent.config import PersonalFileConfig
 from edge_cloud_agent.personal_search.ingest import _build_item, _file_captured_at, run_once
-from edge_cloud_agent.personal_search.service import PersonalFileSearchService
+from edge_cloud_agent.personal_search.service import (
+    PersonalFileSearchService,
+    _infer_source_from_path,
+)
 from edge_cloud_agent.personal_search.storage import PersonalFileStore
 
 
@@ -224,6 +228,33 @@ def test_sweep_per_root_protection(tmp_path):
     (tmp_path / "b_unmounted").rename(root_b)
     result2 = run_once(service, cfg)
     assert (result2.imported, result2.removed, result2.skipped) == (0, 0, 1)
+
+
+def test_macos_volume_junk_pruned(tmp_path):
+    """macOS 卷元数据目录（Spotlight/fseventsd 等）默认剪枝。"""
+
+    root = tmp_path / "vol"
+    (root / ".Spotlight-V100").mkdir(parents=True)
+    (root / ".fseventsd").mkdir()
+    (root / ".Spotlight-V100" / "index.txt").write_text("junk", encoding="utf-8")
+    (root / ".fseventsd" / "log.txt").write_text("junk", encoding="utf-8")
+    (root / "real.txt").write_text("real file", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, str(root), name="macjunk")
+    result = run_once(service, cfg)
+    assert result.scanned == 1
+    assert service.store.list_all()[0].title == "real"
+
+
+def test_infer_source_macos_screenshots():
+    """macOS 截图文件名（中/英）应识别为 camera 来源。"""
+
+    assert _infer_source_from_path(Path("/Users/x/Desktop/截屏2026-09-24 下午3.00.00.png")) == "camera"
+    assert _infer_source_from_path(Path("/Users/x/Desktop/Screen Shot 2026-09-24 at 3.00 PM.png")) == "camera"
+    assert _infer_source_from_path(Path("/Users/x/Desktop/Screenshot 2026-09-24.png")) == "camera"
+    # 微信沙盒路径（macOS 容器布局）仍应命中 wechat
+    wx = Path("/Users/x/Library/Containers/com.tencent.xinWeChat/Data/.../MessageTemp/abc/IMG_001.png")
+    assert _infer_source_from_path(wx) == "wechat"
 
 
 def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):

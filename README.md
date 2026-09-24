@@ -103,6 +103,7 @@ flowchart LR
 | `text_utils.py` | 共享中英文分词器（两条业务线统一口径） |
 | `path_utils.py` | WSL 检测 + /mnt/c → C:\ 路径映射（open 动作回传 Windows 路径） |
 | `scripts/wsl_sources.sh` | WSL 文件索引源目录配置助手（探测 Windows 常见目录多选写入 .env） |
+| `scripts/macos_sources.sh` | macOS 源目录配置助手（含 IM 沙盒/iCloud 探测与 TCC 可读性检测） |
 | `tests/` | 业务层单测（35 例） |
 | `android/` | Android MVP 客户端（Kotlin + Compose，见 [android/README.md](android/README.md)） |
 
@@ -140,7 +141,7 @@ flowchart LR
 | 云端（默认关） | `CLOUD_ENABLED` · `CLOUD_API_BASE` · `CLOUD_API_KEY` · `CLOUD_MODEL_ID` | `false`；`api_base` 默认空，启用时**必须显式配置** |
 | 路由 | `ROUTE_USE_TINYLLM` · `ROUTE_MAX_INPUT_CHARS` · `ROUTE_MIN_EDGE_CONFIDENCE` | `true`=端侧优先（变量名系历史遗留，见「已知约束」）；1800；0.50 |
 | 报销 | `EXPENSE_STORE_PATH` · `EXPENSE_REQUIRED_DOC_TYPES` · `EXPENSE_WATCH_DIR` | `data/expense_store.jsonl`；`invoice,bank_transfer,receipt,approval`；watch 目录空=关闭自动收集 |
-| 文件搜索 | `FILE_MEMORY_SOURCE_DIR` · `FILE_MEMORY_SCAN_EXCLUDE_DIRS` · `FILE_MEMORY_SCAN_INTERVAL_SECONDS` · `FILE_MEMORY_ENABLE_FAISS` · `FILE_MEMORY_FAISS_*_WEIGHT` | 扫描目录支持逗号分隔多根（WSL 索引 Windows 目录用 `scripts/wsl_sources.sh` 配置），空=仅用已有索引；排除目录默认剪掉 node_modules 等；120s；文本/语义/线索权重 0.65/0.30/0.25 可调 |
+| 文件搜索 | `FILE_MEMORY_SOURCE_DIR` · `FILE_MEMORY_SCAN_EXCLUDE_DIRS` · `FILE_MEMORY_SCAN_INTERVAL_SECONDS` · `FILE_MEMORY_ENABLE_FAISS` · `FILE_MEMORY_FAISS_*_WEIGHT` | 扫描目录支持逗号分隔多根（WSL 用 `scripts/wsl_sources.sh`、macOS 用 `scripts/macos_sources.sh` 交互配置），空=仅用已有索引；排除目录默认剪掉 node_modules/.Spotlight 等；120s；文本/语义/线索权重 0.65/0.30/0.25 可调 |
 | 日志 | `APP_LOG_LEVEL` | `INFO`；结构化 event + trace_id，字典见 [docs/API.md](docs/API.md) |
 
 ---
