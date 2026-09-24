@@ -35,7 +35,7 @@
 | 2 | Gemma4VulkanEngine 骨架 v0(CPU 编排逐语句复制 forward + GPU i4 matvec)+ `--gemma4-vk` CLI 接线 + rmsnorm/rope bitwise shader(已写未接线) | v0 端到端 generated_ids 逐位 = CPU golden | **真机 PASS**(2026-09-21:v0 p1 ids 与 golden 逐位一致) |
 | 3 | 专有算子 GPU 化(rmsnorm/rope 接线 → attention/geglu/elementwise shader)→ 35 层全链一次录制一次 submit | 全部 slot 10+i + 99 逐位一致;transcendental 不可逐位 → 降级检查点 | **代码全部落地**(exact_arith 后 shader 全绿 + 新增 elementwise/kv_write shader + kernels 引擎模式 API(engine_setup/rec_*/单 command buffer 录制+保守屏障)+ 引擎 v1(TINYQWEN_G4V=v1,35 层全 GPU 一次 submit,rope 表 host 逐字复制生成,theta+pos 键控缓存,延迟 KV 导入修 prefill 时序)+ engine_ops 四算子真机对拍用例);**真机 PASS**(2026-09-21:v1 e2e p1+p2 ids 与 golden 逐位一致,13cd595;含 H3 sqrt 判定+sqrt_exact、rmsnorm WorkGroupID 修复、KV 共享槽位化) |
 | 4 | PLE 每 token 上传接通 + lm_head(f16,GPU 或留 CPU)+ softcap/argmax CPU 回读 | 端到端逐位 = Phase 0 golden | **已并入 v1 落地**:PLE 块全 GPU(ple_gate matvec+gelu mode1+slice 乘+ple_proj matvec),ple_ctx 每 token 上传;lm_head **刻意留 CPU**——止损点 B 数据:fma_exact 化后 GPU 外推 116.9ms > CPU nt_kv_mt 27.1ms,且省 805MB GPU 副本(f16 shader+API 保留,性能阶段再启用);softcap/argmax = CPU 回读(v0 同款代码);**真机 PASS**(随 v1 e2e 验证,2026-09-21) |
-| 5 | main.cpp 正式集成(`--backend vulkan` 对 gemma4-i4 分支到执行器、内存预检计入 GPU 副本、verify_android.sh BACKEND 参数化) | host CTest + 真机 tests 全绿 + CPU 回归 | 最小接线已提前落地(--gemma4-vk);正式 gate 改造未开始 |
+| 5 | main.cpp 正式集成(`--backend vulkan` 对 gemma4-i4 分支到执行器、内存预检计入 GPU 副本、verify_android.sh BACKEND 参数化) | host CTest + 真机 tests 全绿 + CPU 回归 | **宿主机侧已落地**(2026-09-24:--backend vulkan 按 is_gemma4 分支执行器、--gemma4-vk 成别名;预检计入 GPU 增量(权重上界+KV 上界+512MB),v0 也被粗门禁覆盖;verify BACKEND 参数化 + G4V 透传;host 构建+ctest 全绿、失败路径 fail-fast、CPU 冒烟 4tok 通过);**真机门禁待跑**(BACKEND=vulkan verify + verify_gemma4_vk.sh 逐位主线) |
 | 6 | bench_gemma4_vulkan.sh(CPU vs GPU 配对、热门禁、RSS/温度)+ optimization_log/android.md/本文档回填 | bench 内嵌逐位比对 | 未开始 |
 
 ## 风险与止损点
@@ -65,4 +65,4 @@
 - `tests/test_vulkan_i4.cpp` — 逐位对拍 + 计时探针(仅 TINYQWEN_HAS_VULKAN 注册;含 math/geglu/attention 三个真机 parity 用例)
 - `tests/test_portable_math.cpp` — vendored math 精度门禁(特殊值精确 + 扫描 ≤2ulp + 单调性 + vs 平台 libm 诊断)
 - `scripts/collect_gemma4_golden.sh` — Phase 0 采集
-- `runtime/main.cpp` — `--gemma4-vk` 最小接线
+- `runtime/main.cpp` — Phase 5 正式集成:`--backend vulkan` 对 gemma4 分支到执行器(`--gemma4-vk` 为等价别名)、load 前粗门禁计入 GPU 增量(read_tiny_header + dtype=i4 粗判)、宿主算子 CPU backend
