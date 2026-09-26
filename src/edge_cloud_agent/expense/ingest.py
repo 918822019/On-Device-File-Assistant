@@ -10,6 +10,8 @@ from threading import Event
 from .schemas import ExpenseCollectRequest
 from .service import ExpenseService
 from ..config import ExpenseConfig
+from ..file_io import read_text_with_fallback
+from ..path_utils import as_file_uri, uri_to_path
 
 
 @dataclass
@@ -39,7 +41,9 @@ def _normalize_claim_from_path(root: str, file_path: Path, default_claim_id: str
 
 
 def _as_file_uri(path: Path) -> str:
-    return f"file://{path.as_posix()}"
+    # 委托 path_utils.as_file_uri（单一事实源）：POSIX 与历史格式逐字一致，
+    # Windows 盘符路径产出合法的 file:///C:/...
+    return as_file_uri(path)
 
 
 def _short_hash(path: Path) -> str:
@@ -77,10 +81,9 @@ def _discover_files(cfg: ExpenseConfig) -> list[Path]:
 def _read_text_file(path: Path) -> str | None:
     if path.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg"}:
         return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return None
+    # 编码降级读取（utf-8-sig → gb18030）：Windows 常见 GBK 文件不再静默跳过
+    decoded = read_text_with_fallback(path)
+    return decoded[0] if decoded is not None else None
 
 
 def _sweep_deleted_materials(service: ExpenseService, cfg: ExpenseConfig) -> int:
@@ -97,8 +100,12 @@ def _sweep_deleted_materials(service: ExpenseService, cfg: ExpenseConfig) -> int
     for material in service.store.list_all():
         if not material.file_uri:
             continue
-        # file_uri 格式为 file:///path/to/file
-        path_str = material.file_uri.removeprefix("file://")
+        # URI → 路径用 uri_to_path 兼容新旧格式（file:///C:/x 与 file://C:/x、
+        # file:///abs）。此前 removeprefix("file://") 在 Windows 新格式下会得到
+        # "/C:/x"，exists() 恒 False → 全量误删。
+        path_str = uri_to_path(material.file_uri)
+        if not path_str:
+            continue
         if Path(path_str).exists():
             continue
         service.store.delete_by_file_uri(material.file_uri, persist=False)

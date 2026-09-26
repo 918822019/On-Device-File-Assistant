@@ -33,12 +33,25 @@ cp .env.example .env
 #    - EDGE_DEVICE=cpu / EDGE_EMBEDDING_DEVICE=cpu（Apple Silicon 必须，见「已知约束」）
 #    - CLOUD_ENABLED=false（默认，端侧 only）
 
-# 4. 启动并验证
+# 4. 配置文件索引源目录（跨平台，自动识别 Windows 原生 / WSL / macOS / Linux）
+python scripts/sources.py             # 探测常见目录 → 交互多选 → 写入 .env
+
+# 5. 启动并验证
 make run                              # 或 bash scripts/run.sh
 curl http://127.0.0.1:9000/health     # → {"ok": true}
 ```
 
-跑测试（业务层 81 例单测，纯规则逻辑，**不需要模型权重**）：
+**Windows 原生**（非 WSL）没有 make/bash，用跨平台启动器：
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env                & rem 按需修改
+python scripts\sources.py             & rem 交互选择要索引的目录（--print 只列候选不写）
+python scripts\run.py                 & rem 或 scripts\run.bat；浏览器直开 http://127.0.0.1:9000/web/
+```
+
+跑测试（业务层 165 例单测，纯规则逻辑，**不需要模型权重**）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -102,10 +115,13 @@ flowchart LR
 | `routers/` | chat / embeddings / expense / personal_search 四组路由 |
 | `web/` | Web UI（FastAPI 同源静态托管 `/web`，原生 JS 无构建；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
 | `text_utils.py` | 共享中英文分词器（两条业务线统一口径） |
-| `path_utils.py` | WSL 检测 + /mnt/c → C:\ 路径映射（open 动作回传 Windows 路径） |
-| `scripts/wsl_sources.sh` | WSL 文件索引源目录配置助手（探测 Windows 常见目录多选写入 .env） |
-| `scripts/macos_sources.sh` | macOS 源目录配置助手（含 IM 沙盒/iCloud 探测与 TCC 可读性检测） |
-| `tests/` | 业务层单测（81 例） |
+| `path_utils.py` | 跨平台路径/file URI 工具：平台判定（Windows 原生/WSL/macOS/Linux）、URI 规范化与还原、open 动作回传 Windows 路径 |
+| `file_io.py` | 跨平台文本读取：编码降级链（utf-8-sig → gb18030，Windows GBK 文件不再被跳过）+ 二进制启发式 |
+| `source_discovery.py` | 四平台索引源目录探测逻辑层（纯函数 + 依赖注入，供 scripts/sources.py 与单测使用） |
+| `scripts/sources.py` | 跨平台源目录配置助手（自动识别平台，探测常见目录多选写入 .env；`make sources`） |
+| `scripts/run.py`（+ run.bat/run.ps1） | 跨平台服务启动器（Windows 原生入口；run.sh 保留供 systemd/nohup 使用） |
+| `scripts/wsl_sources.sh` / `macos_sources.sh` | 已废弃 → 薄包装转发到 scripts/sources.py |
+| `tests/` | 业务层单测（165 例） |
 | `android/` | Android MVP 客户端（Kotlin + Compose，见 [android/README.md](android/README.md)） |
 
 ---
@@ -144,7 +160,7 @@ flowchart LR
 | 云端（默认关） | `CLOUD_ENABLED` · `CLOUD_API_BASE` · `CLOUD_API_KEY` · `CLOUD_MODEL_ID` | `false`；`api_base` 默认空，启用时**必须显式配置** |
 | 路由 | `ROUTE_USE_TINYLLM` · `ROUTE_MAX_INPUT_CHARS` · `ROUTE_MIN_EDGE_CONFIDENCE` | `true`=端侧优先（变量名系历史遗留，见「已知约束」）；1800；0.50 |
 | 报销 | `EXPENSE_STORE_PATH` · `EXPENSE_REQUIRED_DOC_TYPES` · `EXPENSE_WATCH_DIR` | `data/expense_store.jsonl`；`invoice,bank_transfer,receipt,approval`；watch 目录空=关闭自动收集 |
-| 文件搜索 | `FILE_MEMORY_SOURCE_DIR` · `FILE_MEMORY_SCAN_EXCLUDE_DIRS` · `FILE_MEMORY_SCAN_INTERVAL_SECONDS` · `FILE_MEMORY_ENABLE_FAISS` · `FILE_MEMORY_FAISS_*_WEIGHT` | 扫描目录支持逗号分隔多根（WSL 用 `scripts/wsl_sources.sh`、macOS 用 `scripts/macos_sources.sh` 交互配置），空=仅用已有索引；排除目录默认剪掉 node_modules/.Spotlight 等；120s；文本/语义/线索权重 0.65/0.30/0.25 可调 |
+| 文件搜索 | `FILE_MEMORY_SOURCE_DIR` · `FILE_MEMORY_SCAN_EXCLUDE_DIRS` · `FILE_MEMORY_TEXT_ENCODINGS` · `FILE_MEMORY_SKIP_CLOUD_PLACEHOLDERS` · `FILE_MEMORY_SCAN_INTERVAL_SECONDS` · `FILE_MEMORY_ENABLE_FAISS` · `FILE_MEMORY_FAISS_*_WEIGHT` | 扫描目录支持逗号分隔多根（各平台统一用 `python scripts/sources.py` 交互配置），空=仅用已有索引；排除目录默认剪掉 node_modules/.Spotlight/$RECYCLE.BIN/各类缓存等；编码降级链 utf-8-sig→gb18030；Windows 默认跳过 OneDrive「仅在线」占位符；120s；文本/语义/线索权重 0.65/0.30/0.25 可调 |
 | 日志 | `APP_LOG_LEVEL` | `INFO`；结构化 event + trace_id，字典见 [docs/API.md](docs/API.md) |
 
 ---
@@ -179,14 +195,16 @@ flowchart LR
 
 ```bash
 pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 81 例，无需模型权重
+pytest tests/                          # 165 例，无需模型权重
 ```
 
 覆盖：共享分词（jieba 口径与无 jieba 降级口径）、时间线索匹配、状态判定、
 澄清重排收敛（回归：reply 可翻盘、分值不越界）、回复过滤（时间/来源线索）、
 报销字段抽取（金额/日期/商户）、JSONL 存储往返与容错、增量扫描生命周期
-（导入/跳过/变更重导/删除清理）、多根源目录与排除剪枝（WSL/macOS 索引层）、
-WSL 路径映射。
+（导入/跳过/变更重导/删除清理）、多根源目录与排除剪枝（WSL/macOS/Windows
+索引层）、跨平台路径/file URI 规范化与还原（新旧格式兼容、幽灵清理回归）、
+编码降级读取（GBK/BOM/二进制）、四平台源目录探测与 .env 写入、跨平台启动器。
+平台相关用例全部经 monkeypatch/依赖注入模拟，任意 OS 上均可运行。
 
 ---
 
@@ -201,7 +219,13 @@ WSL 路径映射。
    `optimum` + CUDA，本机不可用；可经 `EDGE_QUANTIZATION` 重新启用。
 4. **端侧 CPU 推理速度有限**：E2B 非量化 bfloat16 约 9.5 GiB，首 token 延迟
    以秒计；embedding 单条短文本约百毫秒级。
-5. 业务层遗留项（中文分词、会话持久化等）清单见
+5. **索引与部署机器/形态绑定**：`file_id` 由路径派生，同一文件在 WSL
+   （`/mnt/c/...`）与 Windows 原生（`C:/...`）下 id 不同，store/FAISS 文件
+   跨部署形态搬移会全量重导（备注/归档按 file_id 关联，也会失联）。换部署
+   形态请重建索引，详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
+6. **Windows 长路径（MAX_PATH 260）**：微信/OneDrive 深层嵌套文件会计入
+   扫描 errors（不中断），建议开启系统 `LongPathsEnabled`。
+7. 业务层遗留项（中文分词、会话持久化等）清单见
    [docs/BUSINESS_LAYER.md](docs/BUSINESS_LAYER.md) §四。
 
 ---

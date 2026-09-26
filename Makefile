@@ -1,9 +1,12 @@
-.PHONY: help install run test deploy uninstall start stop restart status logs lint
+.PHONY: help install run run-any sources test deploy uninstall start stop restart status logs lint
 
 help:
 	@echo "Available targets:"
 	@echo "  make install    Install dependencies"
-	@echo "  make run        Start service (foreground, dev)"
+	@echo "  make run        Start service (foreground, dev; bash)"
+	@echo "  make run-any    Start service via cross-platform scripts/run.py"
+	@echo "                  (Windows 原生无 make 时: python scripts\\run.py)"
+	@echo "  make sources    Configure index source dirs (cross-platform, scripts/sources.py)"
 	@echo "  make test       Run business-layer tests"
 	@echo "  make deploy     One-shot server deploy (Linux + systemd, see docs/DEPLOYMENT.md)"
 	@echo "  make start      Start deployed service"
@@ -19,6 +22,12 @@ install:
 
 run:
 	bash scripts/run.sh
+
+run-any:
+	python3 scripts/run.py
+
+sources:
+	python3 scripts/sources.py
 
 test:
 	pytest tests/

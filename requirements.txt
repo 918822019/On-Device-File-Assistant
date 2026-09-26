@@ -11,7 +11,11 @@ transformers==5.17.0
 # （256 值/超块、6-bit scale 打包，写错是静默乱码）。
 gguf==0.19.0
 accelerate==1.5.1
-bitsandbytes==0.42.0
+# bitsandbytes 0.42.0 无 Windows wheel，会让 Windows 原生 pip install 直接失败。
+# 代码中仅 edge_runtime._load_model_with_quantization 懒加载（bnb 量化路径，
+# 默认不启用），跳过安装不影响端侧 CPU 推理与索引构建。
+# Windows 上确需 bnb 量化时：pip install "bitsandbytes>=0.44"（官方已发 Windows wheel）。
+bitsandbytes==0.42.0; sys_platform != "win32"
 modelscope==1.20.0
 faiss-cpu==1.10.0
 numpy==2.3.2

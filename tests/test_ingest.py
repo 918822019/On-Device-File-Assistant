@@ -271,3 +271,170 @@ def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):
     result = run_once(service, cfg)
     assert result.removed == 0
     assert len(service.store.list_all()) == 1
+
+
+# ---------------- 跨平台：编码降级 / URI 规范化 / 云占位符 ----------------
+
+from edge_cloud_agent.path_utils import as_file_uri  # noqa: E402
+from edge_cloud_agent.personal_search import ingest as ingest_mod  # noqa: E402
+from edge_cloud_agent.personal_search.ingest import (  # noqa: E402
+    _as_file_uri,
+    _is_cloud_placeholder,
+)
+
+
+def test_gb18030_file_indexed_end_to_end(tmp_path):
+    """Windows 常见 GBK 编码文本：整链路（run_once）后正文可检索。"""
+
+    root = tmp_path / "gbk_root"
+    root.mkdir()
+    f = root / "会议纪要.txt"
+    f.write_bytes("会议纪要 报销单 金额128元".encode("gb18030"))
+
+    cfg, service = _make_service(tmp_path, str(root), name="gbk")
+    result = run_once(service, cfg)
+    assert (result.imported, result.errors) == (1, 0)
+    item = service.store.list_all()[0]
+    assert "报销单" in item.raw_text
+
+
+def test_utf8_bom_not_in_raw_text(tmp_path):
+    root = tmp_path / "bom_root"
+    root.mkdir()
+    f = root / "note.txt"
+    f.write_bytes("\ufeff正文内容".encode("utf-8"))
+
+    cfg, service = _make_service(tmp_path, str(root), name="bom")
+    run_once(service, cfg)
+    item = service.store.list_all()[0]
+    # utf-8-sig 剥掉 BOM：正文首字符不得残留 \ufeff
+    assert item.raw_text == "正文内容"
+    assert "\ufeff" not in item.raw_text
+
+
+def test_build_item_encodings_from_cfg(tmp_path):
+    """cfg.text_encodings 可限定编码链：仅 ascii 时中文文件降级为文件名语义。"""
+
+    f = tmp_path / "中文笔记.txt"
+    f.write_bytes("正文内容".encode("utf-8"))
+    cfg = PersonalFileConfig(
+        store_path=str(tmp_path / "s.jsonl"),
+        state_path=str(tmp_path / "st.json"),
+        source_dir=str(tmp_path),
+        text_encodings="ascii",
+        enable_faiss=False,
+    )
+    service = PersonalFileSearchService(
+        config=cfg, store=PersonalFileStore(cfg.store_path), embedding_runtime=None
+    )
+    item = _build_item(service, cfg, f)
+    assert item.raw_text.startswith("文件名:")
+
+
+def test_as_file_uri_delegates_to_path_utils():
+    """两处 _as_file_uri 与 path_utils.as_file_uri 单一事实源（防再漂移）。"""
+
+    from edge_cloud_agent.expense.ingest import _as_file_uri as expense_uri
+
+    samples = [Path("/Users/x/a.png"), Path("/mnt/c/Users/x/a.png"), Path("C:/Users/x/a.png")]
+    for p in samples:
+        assert _as_file_uri(p) == as_file_uri(p)
+        assert expense_uri(p) == as_file_uri(p)
+    # Windows 盘符：合法三斜杠；POSIX：与历史格式一致
+    assert as_file_uri(Path("C:/x/a.png")) == "file:///C:/x/a.png"
+    assert as_file_uri(Path("/tmp/x.txt")) == "file:///tmp/x.txt"
+
+
+def test_store_add_or_update_drops_stale_uri_key(tmp_path):
+    """URI 变更后旧键不得残留在 _by_file_uri（防悬空键积累）。"""
+
+    from edge_cloud_agent.personal_search.storage import PersonalFileItem
+
+    store = PersonalFileStore(str(tmp_path / "s.jsonl"))
+    base = dict(
+        file_id="fm_x",
+        title="t",
+        source_app="unknown",
+        doc_type="file",
+        mime_type="",
+        raw_text="r",
+        summary="s",
+        file_path="C:/x/a.png",
+    )
+    store.add_or_update(PersonalFileItem(file_uri="file://C:/x/a.png", **base), persist=False)
+    store.add_or_update(PersonalFileItem(file_uri="file:///C:/x/a.png", **base), persist=False)
+
+    assert store.get_by_file_uri("file://C:/x/a.png") is None
+    assert store.get_by_file_uri("file:///C:/x/a.png") is not None
+
+
+def test_is_cloud_placeholder_detection():
+    """云占位符判定为纯函数：duck-typing stat 结果。"""
+
+    class _St:
+        def __init__(self, attrs):
+            self.st_file_attributes = attrs
+
+    assert _is_cloud_placeholder(_St(0x400000)) is True   # RECALL_ON_DATA_ACCESS
+    assert _is_cloud_placeholder(_St(0x40000)) is True    # RECALL_ON_OPEN
+    assert _is_cloud_placeholder(_St(0x20)) is False      # 普通归档位
+    assert _is_cloud_placeholder(None) is False
+
+    class _PlainSt:  # 非 Windows：无 st_file_attributes 属性
+        pass
+
+    assert _is_cloud_placeholder(_PlainSt()) is False
+
+
+def test_cloud_placeholder_skipped_on_windows(tmp_path, monkeypatch):
+    """Windows 下 OneDrive「仅在线」占位符不进扫描面（防静默全量下载）。"""
+
+    root = tmp_path / "onedrive"
+    root.mkdir()
+    real = root / "real.txt"
+    cloud = root / "online.txt"
+    real.write_text("local content", encoding="utf-8")
+    cloud.write_text("placeholder", encoding="utf-8")
+
+    # 不能 patch 全局 os.name（pathlib 会随之实例化 WindowsPath 崩溃），
+    # 走 ingest 模块的 _is_windows 间接层
+    monkeypatch.setattr(ingest_mod, "_is_windows", lambda: True)
+
+    class _FakeStat:
+        st_file_attributes = ingest_mod._FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+    orig_safe_stat = ingest_mod._safe_stat
+    monkeypatch.setattr(
+        ingest_mod,
+        "_safe_stat",
+        lambda p: _FakeStat() if p.name == "online.txt" else orig_safe_stat(p),
+    )
+
+    cfg, _ = _make_service(tmp_path, str(root), name="cloud")
+    assert ingest_mod._discover_files(cfg) == [real]
+
+    # 关闭开关后占位符重新进扫描面
+    cfg_off = PersonalFileConfig(
+        store_path=str(tmp_path / "cloud_off.jsonl"),
+        state_path=str(tmp_path / "cloud_off_state.json"),
+        source_dir=str(root),
+        skip_cloud_placeholders=False,
+        enable_faiss=False,
+    )
+    assert sorted(p.name for p in ingest_mod._discover_files(cfg_off)) == ["online.txt", "real.txt"]
+
+
+def test_windows_junk_dirs_pruned(tmp_path):
+    """Windows 系统/回收站目录默认剪枝（$RECYCLE.BIN、System Volume Information）。"""
+
+    root = tmp_path / "win_root"
+    (root / "$RECYCLE.BIN").mkdir(parents=True)
+    (root / "System Volume Information").mkdir()
+    (root / "$RECYCLE.BIN" / "deleted.txt").write_text("junk", encoding="utf-8")
+    (root / "System Volume Information" / "sys.txt").write_text("junk", encoding="utf-8")
+    (root / "real.txt").write_text("real file", encoding="utf-8")
+
+    cfg, service = _make_service(tmp_path, str(root), name="winjunk")
+    result = run_once(service, cfg)
+    assert result.scanned == 1
+    assert service.store.list_all()[0].title == "real"

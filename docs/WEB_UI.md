@@ -91,10 +91,13 @@ WSL IP 每次重启会变，方案 B 需要重新执行（可做成登录脚本�
 **1. 多根源目录**——`FILE_MEMORY_SOURCE_DIR` 支持逗号分隔多个根（路径可含空格）：
 
 ```bash
-# 交互式：探测 /mnt/c/Users/* 下常见目录（含 WeChat Files/xwechat_files/QQ 等），多选写入 .env
-bash scripts/wsl_sources.sh
-bash scripts/wsl_sources.sh --print          # 只预览候选不写入
-bash scripts/wsl_sources.sh /path/a /path/b  # 任意平台直接指定
+# 交互式：自动识别平台（WSL 下探测 /mnt/c/Users/* 常见目录，含 WeChat
+# Files/xwechat_files/QQ 等），多选写入 .env
+python scripts/sources.py
+python scripts/sources.py --print            # 只预览候选不写入
+python scripts/sources.py --platform wsl     # 强制按 WSL 探测
+python scripts/sources.py /path/a /path/b    # 任意平台直接指定
+# 旧入口 bash scripts/wsl_sources.sh 仍可用（薄包装转发到 sources.py）
 ```
 
 **2. 排除目录剪枝**——跨 9P 扫描成本高，`FILE_MEMORY_SCAN_EXCLUDE_DIRS`
@@ -109,7 +112,8 @@ bash scripts/wsl_sources.sh /path/a /path/b  # 任意平台直接指定
 **4. 打开动作的路径映射**——`file:///mnt/c/...` 对 Windows 浏览器没有意义。
 WSL 环境下 open 动作会自动附带 `windows_path`（`C:\Users\...`），
 Web UI 在动作结果区展示并支持一键复制，粘到资源管理器地址栏即可打开。
-检测可用 `FILE_MEMORY_WSL_PATH_MAP=true/false` 强制覆盖。
+检测可用 `FILE_MEMORY_WSL_PATH_MAP=true/false` 强制覆盖
+（Windows 原生部署对应 `FILE_MEMORY_WINDOWS_NATIVE_PATH_MAP`）。
 
 **5. 幽灵清理按根保护**——某个根暂不可达（如 `/mnt/c` 未就绪）时，
 属于它的索引记录不会被误删；只有可达根下确实消失的文件才被清理。
@@ -131,8 +135,9 @@ Web UI 在动作结果区展示并支持一键复制，粘到资源管理器地�
 iCloud Drive），多选写入 `.env`：
 
 ```bash
-bash scripts/macos_sources.sh           # 交互选择（附 TCC 可读性检测）
-bash scripts/macos_sources.sh --print   # 只预览候选
+python scripts/sources.py               # 交互选择（附 TCC 可读性检测）
+python scripts/sources.py --print       # 只预览候选
+# 旧入口 bash scripts/macos_sources.sh 仍可用（薄包装转发到 sources.py）
 ```
 
 **2. TCC 隐私权限（macOS 特有，最常踩的坑）**——未授权进程读
@@ -151,6 +156,46 @@ watch 周期反复重算 hash，文件量大时可调大 `FILE_MEMORY_SCAN_INTER
 
 **5. 打开动作**——`file://` URI 浏览器不允许从 http 页面跳转，Web UI 的
 「复制路径」按钮会给纯 POSIX 路径，粘到 Finder「前往文件夹」（⌘⇧G）直达。
+
+## Windows 原生运行（非 WSL）
+
+后端直接跑在 Windows 上（无 make/bash 依赖），浏览器直开
+`http://127.0.0.1:9000/web/`，**不需要** WSL 那套 localhost 转发/镜像网络配置。
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt   rem bitsandbytes 会自动跳过（无 Windows wheel，仅量化链路需要）
+copy .env.example .env                          rem EDGE_LOCAL_DIR 指向权重目录；EDGE_DEVICE 可留 auto（无 MPS 问题）
+python scripts\sources.py                       rem 探测 桌面/下载/文档/图片 + 微信/QQ/钉钉 + OneDrive，多选写入 .env
+python scripts\run.py                           rem 或 scripts\run.bat / powershell -File scripts\run.ps1
+```
+
+**Windows 特有要点**：
+
+1. **文件 URI**——索引内 `file_uri` 为合法的 `file:///C:/...` 形式；open 动作
+   与 WSL 对齐，附带 `windows_path`（`C:\...`），Web UI 一键复制后粘到资源
+   管理器地址栏即可。
+2. **GBK/ANSI 文本**——记事本等工具产出的非 UTF-8 文本按
+   `FILE_MEMORY_TEXT_ENCODINGS`（默认 `utf-8-sig,gb18030`）降级链读取，
+   不再被静默跳过；两种编码都解不出的文件仍降级为文件名语义。
+3. **OneDrive「仅在线」占位符**——默认跳过
+   （`FILE_MEMORY_SKIP_CLOUD_PLACEHOLDERS=true`），不会因扫描触发静默全量
+   下载；已下载到本地的文件正常入库。
+4. **长路径（MAX_PATH 260）**——微信/OneDrive 深层嵌套可能超限，超限文件
+   计入扫描 errors（不中断）；建议开启注册表 `LongPathsEnabled`。
+5. **排除目录**——默认清单已含 `$RECYCLE.BIN`、`System Volume Information`、
+   各类浏览器/Electron 缓存目录；**不排除整棵 AppData**（微信/钉钉数据在其
+   下），想彻底不扫可自行把它加进 `FILE_MEMORY_SCAN_EXCLUDE_DIRS`。
+6. **服务化**——`scripts/service.sh`/`deploy.sh` 是 systemd 专属，Windows 原生
+   请前台运行 `run.py`，或用「任务计划程序」/NSSM 等自行托管。
+
+## Linux 桌面运行
+
+与 macOS 形态相同（`make run` 前台或 `service.sh start`）。
+`python scripts/sources.py` 会按 `~/.config/user-dirs.dirs` → `xdg-user-dir`
+命令 → `~/Desktop` 等默认子目录三级回落探测源目录（中文系统的「桌面/下载」
+目录名也能正确识别）。打开动作的「复制路径」给纯 POSIX 路径，粘到文件管理器
+（Nautilus/Dolphin 的 Ctrl+L）直达。
 
 ## 安全提醒
 

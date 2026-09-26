@@ -74,6 +74,12 @@ class PersonalFileStore:
         """写入内存索引；persist=False 时延迟落盘（批量导入场景配合 flush 使用）。"""
 
         with self._lock:
+            prev = self._items.get(item.file_id)
+            if prev is not None and prev.file_uri and prev.file_uri != item.file_uri:
+                # 同一 file_id 的 URI 变化（如格式规范化）后清理旧键，
+                # 防止 _by_file_uri 积累悬空键
+                if self._by_file_uri.get(prev.file_uri) == item.file_id:
+                    del self._by_file_uri[prev.file_uri]
             self._items[item.file_id] = item
             self._by_file_uri[item.file_uri] = item.file_id
             if persist:

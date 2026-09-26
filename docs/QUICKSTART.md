@@ -14,6 +14,16 @@ pip install -r requirements.txt
 
 > 需要 transformers **5.x**（4.57 及以下不认识 `gemma4` 架构）。当前 requirements.txt 钉 5.17.0。
 
+**Windows 原生**（非 WSL）：
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
+
+> `bitsandbytes` 已按平台标记自动跳过（无 Windows wheel，仅弃用的量化链路需要）；
+> 其余依赖均有 Windows wheel。索引构建/文件搜索不依赖 GPU。
+
 ## 1.1 下载权重到 models/（已 gitignore）
 
 ```bash
@@ -40,6 +50,20 @@ cp .env.example .env
 - `EDGE_LOCAL_DIR` / `EDGE_EMBEDDING_LOCAL_DIR`：指向上一步下载的 `models/` 目录
 - `EDGE_EMBEDDING_TORCH_DTYPE=bfloat16`：本机验证为确定且无 NaN
 
+## 2.1 配置文件索引源目录（可选，跨平台）
+
+需要「个人文件搜索」时，用跨平台助手探测常见目录（自动识别 Windows 原生 /
+WSL / macOS / Linux，含微信/QQ/钉钉/OneDrive/iCloud 目录）并多选写入 `.env`：
+
+```bash
+python scripts/sources.py            # 交互选择（或 make sources）
+python scripts/sources.py --print    # 只预览候选，不写 .env
+```
+
+旧入口 `scripts/wsl_sources.sh` / `scripts/macos_sources.sh` 仍可用（薄包装
+转发）。平台特有注意事项（macOS TCC 授权、Windows OneDrive 占位符/长路径、
+WSL 9P 首扫性能）见 [WEB_UI.md](WEB_UI.md)。
+
 ## 3. 启动服务
 
 ```bash
@@ -50,6 +74,12 @@ make run
 
 ```bash
 bash scripts/run.sh
+```
+
+Windows 原生（无 make/bash）：
+
+```bat
+python scripts\run.py     & rem 或 scripts\run.bat / powershell -File scripts\run.ps1
 ```
 
 ## 4. 健康检查

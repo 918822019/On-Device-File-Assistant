@@ -233,11 +233,14 @@ function showActionResult(r) {
   parts.push(`<div>${esc(r.message || "")}</div>`);
   if (r.file_uri) {
     const isHttp = /^https?:\/\//.test(r.file_uri);
-    // file:// URI 浏览器打不开（http 页面禁跳 file://），复制时剥掉前缀给纯路径：
-    // macOS 粘到 Finder「前往文件夹」(⌘⇧G)、Linux 粘到文件管理器均可直达
-    const copyValue = r.file_uri.startsWith("file://")
-      ? r.file_uri.slice("file://".length)
-      : r.file_uri;
+    // file:// URI 浏览器打不开（http 页面禁跳 file://），复制时优先用后端映射好的
+    // windows_path（WSL / Windows 原生）；否则剥掉前缀给纯路径：macOS 粘到 Finder
+    // 「前往文件夹」(⌘⇧G)、Linux 粘到文件管理器均可直达。注意 Windows URI 是
+    // file:///C:/...，直接 slice("file://") 会多出一个前导斜杠，故优先 windows_path。
+    const copyValue = r.windows_path
+      || (r.file_uri.startsWith("file://")
+        ? r.file_uri.slice("file://".length)
+        : r.file_uri);
     parts.push(`<div class="uri-line">${isHttp
       ? `<a href="${esc(r.file_uri)}" target="_blank" rel="noopener">${esc(r.file_uri)}</a>`
       : esc(r.file_uri)}

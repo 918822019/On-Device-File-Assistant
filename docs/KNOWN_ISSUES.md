@@ -434,3 +434,39 @@ CPU 推理可承受的上限**。真正的约束是运行硬件而非模型能�
 （实测 >30s），健康检查/编排系统可能误判为启动失败。
 
 建议改为后台异步预热 + `/health` 立即返回就绪状态（并在就绪前对相关接口返回 503）。
+
+## O11. 文件索引与部署机器/形态绑定，不可迁移
+
+`file_id = "fm_" + md5(path.as_posix())[:14]`（`personal_search/service.next_file_id`），
+`file_uri` 同样由路径派生。同一份文件在不同部署形态下路径字面不同：
+
+| 部署形态 | 同一文件的路径 | file_id / file_uri |
+|---|---|---|
+| WSL | `/mnt/c/Users/x/a.png` | 与 Windows 原生**不同** |
+| Windows 原生 | `C:/Users/x/a.png` | 与 WSL **不同** |
+| macOS / Linux | `/Users/x/a.png` | 机器间路径一致时可复用 |
+
+后果：把 `data/personal_file_store.jsonl` + FAISS 索引从一种形态搬到另一种
+（如 WSL → Windows 原生）会全量失配重导，且备注/归档（`file_state.json`
+按 file_id 关联）全部失联；旧记录会被幽灵清理按根清掉。
+
+**处置**：明确为设计边界——索引与部署机器绑定，换形态请重建索引（备注/归档
+如需保留可手工迁移 file_state.json 的键）。**不改** file_id 派生方式：改动会
+让现有全部部署的 file_id 变化，代价远大于收益。可选 P2：提供
+`scripts/migrate_file_ids.py`（旧 id → 新 id，同时迁移 file_state.json）。
+
+关联：Windows 原生首次从历史 `file://C:/...`（非法形式）索引升级时，
+`file:///C:/...` 新 URI 首查不命中旧记录，会按「新增」重读内容 + 重算一次
+embedding（file_id 不变，备注不丢，属一次性成本）；POSIX 平台 URI 字面
+不变，零成本。
+
+## O12. Windows 长路径（MAX_PATH 260）超限文件计入扫描 errors
+
+微信（`WeChat Files/wxid_.../Msg/Attach/...`）与 OneDrive 的深层嵌套容易超过
+260 字符限制，`stat`/`open` 抛 `OSError` → 该文件计入 ingest 的 `errors`
+（per-file try/except 兜住，不中断扫描），内容不可检索。
+
+处置：建议开启系统级长路径支持（注册表
+`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1`，需重启）。
+**不引入** `\\?\` 前缀方案：会改变 file_path/file_uri/file_id 字面值，
+破坏索引稳定性（见 O11）。

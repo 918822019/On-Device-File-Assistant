@@ -26,6 +26,8 @@ from .service import PersonalFileSearchService
 from .storage import PersonalFileItem
 from .service import _now_iso
 from ..config import PersonalFileConfig
+from ..file_io import DEFAULT_ENCODINGS, parse_encodings, read_text_with_fallback
+from ..path_utils import as_file_uri
 
 
 _LOGGER = logging.getLogger("agent_server.personal_search.ingest")
@@ -76,7 +78,9 @@ def source_roots(cfg: PersonalFileConfig) -> list[Path]:
         if not chunk:
             continue
         path = Path(chunk).expanduser().resolve()
-        key = str(path)
+        # normcase：Windows 文件系统大小写不敏感，c:\x 与 C:\x 是同一个根；
+        # POSIX 上 normcase 为恒等变换，行为不变
+        key = os.path.normcase(str(path))
         if key in seen:
             continue
         seen.add(key)
@@ -88,11 +92,54 @@ def _exclude_dir_names(cfg: PersonalFileConfig) -> set[str]:
     return {c.strip().lower() for c in (cfg.scan_exclude_dirs or "").split(",") if c.strip()}
 
 
+# Windows 云占位符文件属性位（OneDrive 等「仅在线」文件）：读取会触发静默
+# 全量下载，扫描阶段直接排除出扫描面。非 Windows 平台无 st_file_attributes
+# （或恒为 0），判定自然短路为 False。
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+
+
+def _is_windows() -> bool:
+    """当前进程是否 Windows 原生。
+
+    独立间接层而非直接读 os.name：全局 patch os.name 会让 pathlib 在
+    非 Windows 机器上实例化 WindowsPath 崩溃，单测只能 patch 本函数。
+    """
+
+    return os.name == "nt"
+
+
+def _safe_stat(path: Path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def _is_cloud_placeholder(st) -> bool:
+    """判断 stat 结果是否为 Windows 云占位符文件（st 为 None / 非 Windows → False）。"""
+
+    if st is None:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & (_FILE_ATTRIBUTE_RECALL_ON_OPEN | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+
+
 def _discover_files(cfg: PersonalFileConfig) -> list[Path]:
     """遍历全部源根目录，返回满足后缀过滤的文件清单（排除目录剪枝）。"""
 
     suffix_set = _normalize_root_suffix_set(cfg)
     excludes = _exclude_dir_names(cfg)
+    # 云占位符检测只在 Windows 上有意义；先按平台门控，
+    # 避免其他平台每个文件多一次 stat
+    skip_placeholders = bool(getattr(cfg, "skip_cloud_placeholders", True)) and _is_windows()
+
+    def _wanted(path: Path) -> bool:
+        if path.suffix.lower() not in suffix_set:
+            return False
+        if skip_placeholders and _is_cloud_placeholder(_safe_stat(path)):
+            return False
+        return True
 
     files: list[Path] = []
     for root in source_roots(cfg):
@@ -104,7 +151,7 @@ def _discover_files(cfg: PersonalFileConfig) -> list[Path]:
             except OSError:
                 continue
             for item in entries:
-                if item.is_file() and item.suffix.lower() in suffix_set:
+                if item.is_file() and _wanted(item):
                     files.append(item)
             continue
         # os.walk + 原地剪枝。此前用 rglob("*")：无法跳过整棵子树，WSL 下
@@ -115,22 +162,29 @@ def _discover_files(cfg: PersonalFileConfig) -> list[Path]:
                 dirnames[:] = [d for d in dirnames if d.lower() not in excludes]
             for name in filenames:
                 path = Path(dirpath) / name
-                if path.suffix.lower() in suffix_set:
+                if _wanted(path):
                     files.append(path)
     files.sort()
     return files
 
 
-def _read_text_content(path: Path) -> tuple[str, str | None, str]:
-    """抽取可用于检索的文本内容与文档类型。"""
+def _read_text_content(
+    path: Path,
+    encodings: Sequence[str] | None = None,
+) -> tuple[str, str | None, str]:
+    """抽取可用于检索的文本内容与文档类型。
+
+    文本后缀走编码降级读取（默认 utf-8-sig → gb18030，见 file_io）：
+    Windows 常见 GBK/ANSI 文件不再被静默跳过，BOM 不再混入正文。
+    全部解码失败（或二进制）才降级为文件名语义。
+    """
 
     suffix = path.suffix.lower()
     if suffix in {".txt", ".md", ".json", ".csv", ".log"}:
-        try:
-            text = path.read_text(encoding="utf-8")
-            return text, path.suffix.lower().strip("."), f"text/{path.suffix.lower().strip('.')}"
-        except Exception:
-            pass
+        decoded = read_text_with_fallback(path, encodings=encodings or DEFAULT_ENCODINGS)
+        if decoded is not None:
+            text = decoded[0]
+            return text, suffix.strip("."), f"text/{suffix.strip('.')}"
 
     fallback = _extract_filename_semantics(path)
     if suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
@@ -165,9 +219,14 @@ def _infer_doc_type(suffix: str) -> str:
 
 
 def _as_file_uri(path: Path) -> str:
-    """统一文件 URI 形式，避免不同系统路径差异导致的展示抖动。"""
+    """统一文件 URI 形式（委托 path_utils.as_file_uri，单一事实源）。
 
-    return f"file://{path.as_posix()}"
+    POSIX 与历史 ``f"file://{as_posix()}"`` 逐字一致（存量索引零失配）；
+    Windows 盘符路径产出合法的 ``file:///C:/...``（旧形式 ``file://C:/...``
+    会把盘符落在 authority 位）。
+    """
+
+    return as_file_uri(path)
 
 
 def _file_captured_at(path: Path) -> str:
@@ -208,7 +267,10 @@ def _build_item(service: PersonalFileSearchService, cfg: PersonalFileConfig, pat
 包括：原文摘要、标签、视觉线索、来源识别、embedding。
 """
 
-    raw_text, doc_type_guess, mime_type = _read_text_content(path)
+    raw_text, doc_type_guess, mime_type = _read_text_content(
+        path,
+        encodings=parse_encodings(getattr(cfg, "text_encodings", "")),
+    )
     suffix = path.suffix.lower()
     source_app = service.detect_source_app(path)
     now = _now_iso()
@@ -270,7 +332,8 @@ def _sweep_deleted_files(service: PersonalFileSearchService, cfg: PersonalFileCo
     roots = source_roots(cfg)
     if not roots:
         return 0
-    reachable = {str(r) for r in roots if r.is_dir()}
+    # normcase 与 source_roots 的去重口径一致（Windows 大小写不敏感）
+    reachable = {os.path.normcase(str(r)) for r in roots if r.is_dir()}
     if not reachable:
         return 0
 
@@ -282,7 +345,7 @@ def _sweep_deleted_files(service: PersonalFileSearchService, cfg: PersonalFileCo
         if path.exists():
             continue
         owner = _owning_root(path, roots)
-        if owner is not None and str(owner) not in reachable:
+        if owner is not None and os.path.normcase(str(owner)) not in reachable:
             continue
         service.store.delete_by_file_uri(item.file_uri, persist=False)
         removed += 1

@@ -138,12 +138,19 @@ class PersonalFileConfig:
     source_dir: str = os.getenv("FILE_MEMORY_SOURCE_DIR", "")
     # 扫描时按目录名剪枝（大小写不敏感）。WSL 下跨 9P 扫 /mnt/c 成本高，
     # 剪掉依赖/缓存/回收站目录是控制扫描面的关键；置空字符串可关闭剪枝。
-    # 后半段为 macOS 卷元数据目录（Spotlight/fseventsd/废纸篓等），外置卷与
-    # iCloud 同步目录下常见，跨平台保留无害。
+    # 分组：通用开发目录 / macOS 卷元数据（Spotlight/fseventsd/废纸篓等）/
+    # Windows 系统与回收站（$RECYCLE.BIN 等，误把根设成 C:\ 时的救命闸）/
+    # 浏览器与 Electron/IM 缓存（体量大且无检索价值）。跨平台保留均无害。
+    # 注意：不排除整棵 AppData —— 微信/钉钉数据在其下，整树排除会剪空已选源根；
+    # 想彻底不扫可自行把 AppData 加进本变量。
     scan_exclude_dirs: str = os.getenv(
         "FILE_MEMORY_SCAN_EXCLUDE_DIRS",
         ".git,node_modules,.venv,__pycache__,.cache,.Trash,.tmp,.idea,.pytest_cache,.gradle,"
-        ".Spotlight-V100,.fseventsd,.TemporaryItems,.DocumentRevisions-V100,.Trashes,.apdisk",
+        ".Spotlight-V100,.fseventsd,.TemporaryItems,.DocumentRevisions-V100,.Trashes,.apdisk,"
+        "$RECYCLE.BIN,System Volume Information,$WinREAgent,Windows,ProgramData,PerfLogs,"
+        "WinSxS,Installer,Config.Msi,found.000,"
+        "Temp,Temporary Internet Files,INetCache,Cache,Code Cache,GPUCache,CacheStorage,"
+        "Crashpad,Service Worker",
     )
     scan_interval_seconds: int = _env_int("FILE_MEMORY_SCAN_INTERVAL_SECONDS", 120)
     scan_file_suffixes: str = os.getenv(
@@ -151,11 +158,17 @@ class PersonalFileConfig:
         ".txt,.md,.json,.csv,.log,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.png,.jpg,.jpeg,.gif,.bmp,.webp,.mp4,.mov,.m4a,.mp3,.wav",
     )
     scan_recursive: bool = _env_bool("FILE_MEMORY_SCAN_RECURSIVE", True)
+    # Windows：跳过 OneDrive 等云盘的「仅在线」占位符文件。占位符被 read_bytes()
+    # 读取会触发静默全量下载（首扫流量/时长失控），默认开启跳过；仅 Windows 生效。
+    skip_cloud_placeholders: bool = _env_bool("FILE_MEMORY_SKIP_CLOUD_PLACEHOLDERS", True)
     top_k_default: int = _env_int("FILE_MEMORY_TOP_K_DEFAULT", 8)
     max_search_query_len: int = _env_int("FILE_MEMORY_MAX_QUERY_LEN", 120)
     # 入库文件内容的截断长度。此前误复用 max_search_query_len（120 字符，
     # 那是"查询"的截断长度），导致文档正文只有开头一小段可被检索。
     raw_text_max_chars: int = _env_int("FILE_MEMORY_RAW_TEXT_MAX_CHARS", 2000)
+    # 文本读取编码降级链（逗号分隔，按序尝试，全部失败降级为文件名语义）。
+    # utf-8-sig 兼容带/不带 BOM；gb18030 覆盖 Windows 常见 GBK/ANSI 文件。
+    text_encodings: str = os.getenv("FILE_MEMORY_TEXT_ENCODINGS", "utf-8-sig,gb18030")
     enable_faiss: bool = _env_bool("FILE_MEMORY_ENABLE_FAISS", True)
     faiss_index_path: str = os.getenv(
         "FILE_MEMORY_FAISS_INDEX_PATH",

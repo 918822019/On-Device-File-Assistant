@@ -61,11 +61,19 @@
 - **captured_at 取文件 mtime**，不是扫描时刻——时间线索检索的锚点。
 - **判重前置**：未变更文件不重读内容、不重算 embedding（watch 周期成本控制的关键）。
 - **/search 不再同步扫描**：请求路径只做节流异步触发，首查延迟与文件量解耦。
-- **多根源目录**（WSL 场景）：`FILE_MEMORY_SOURCE_DIR` 逗号分隔多根，遍历用
-  os.walk + `FILE_MEMORY_SCAN_EXCLUDE_DIRS` 整棵剪枝（跨 9P 扫 /mnt/c 的成本控制）；
-  配置助手 `scripts/wsl_sources.sh`。open 动作在 WSL 下附带 `windows_path`
-  （/mnt/c → C:\ 映射，`path_utils.py`），Web UI 可复制。详见
-  [WEB_UI.md](WEB_UI.md)「WSL 文件索引层」。
+- **多根源目录**（跨平台）：`FILE_MEMORY_SOURCE_DIR` 逗号分隔多根，遍历用
+  os.walk + `FILE_MEMORY_SCAN_EXCLUDE_DIRS` 整棵剪枝（跨 9P 扫 /mnt/c 的成本控制；
+  默认清单含 macOS 卷元数据与 Windows 系统/回收站/缓存目录）；
+  配置助手统一为跨平台的 `scripts/sources.py`（逻辑层 `source_discovery.py`，
+  自动识别 Windows 原生 / WSL / macOS / Linux；旧 `wsl_sources.sh` /
+  `macos_sources.sh` 已改薄包装转发）。open 动作在 WSL 与 Windows 原生下
+  附带 `windows_path`（`path_utils.to_windows_path`），Web UI 可复制。
+- **跨平台读取**：文本按 `FILE_MEMORY_TEXT_ENCODINGS`（默认 utf-8-sig → gb18030）
+  降级链读取（`file_io.py`），Windows GBK 文件不再静默跳过；`file_uri` 在
+  Windows 盘符路径下为合法 `file:///C:/...`，POSIX 与历史格式逐字一致
+  （存量索引零失配）；Windows 下 OneDrive「仅在线」占位符默认跳过，
+  防扫描触发静默下载。详见 [WEB_UI.md](WEB_UI.md)「WSL 文件索引层」与
+  「Windows 原生运行」。
 
 ### 1.3 检索打分（`_score_item`）
 

@@ -17,7 +17,7 @@ from time import perf_counter
 
 from ..analytics import record_safe
 from ..config import PersonalFileConfig
-from ..path_utils import is_wsl, wsl_to_windows_path
+from ..path_utils import to_windows_path, uri_to_path
 from ..personal_search.ingest import run_once
 from ..personal_search.schemas import (
     FileActionRequest,
@@ -362,10 +362,11 @@ def _execute_impl(req: FileActionRequest, request: Request) -> FileActionRespons
                 annotations=service.get_annotation(req.file_id),
                 next_action_suggestions=["分享", "加备注", "归档"],
             )
-        # WSL 部署：file:///mnt/c/... 对 Windows 浏览器无意义，附带映射后的
-        # Windows 路径（C:\...）供前端展示/复制。非 WSL 环境为 None，行为不变。
-        windows_path = (
-            wsl_to_windows_path(file_item.file_path) if is_wsl() else None
+        # WSL / Windows 原生部署：file URI 对 Windows 浏览器无意义或含前导斜杠，
+        # 附带映射后的 Windows 路径（C:\...）供前端展示/复制。
+        # macOS / Linux 为 None，行为不变。
+        windows_path = to_windows_path(
+            file_item.file_path or uri_to_path(file_item.file_uri)
         )
         _LOGGER.info(
             "personal-search-api-execute-open-ok",
