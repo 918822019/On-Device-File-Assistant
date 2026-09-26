@@ -64,12 +64,12 @@
 - **多根源目录**（跨平台）：`FILE_MEMORY_SOURCE_DIR` 逗号分隔多根，遍历用
   os.walk + `FILE_MEMORY_SCAN_EXCLUDE_DIRS` 整棵剪枝（跨 9P 扫 /mnt/c 的成本控制；
   默认清单含 macOS 卷元数据与 Windows 系统/回收站/缓存目录）；
-  配置助手统一为跨平台的 `scripts/sources.py`（逻辑层 `source_discovery.py`，
+  配置助手统一为跨平台的 `scripts/sources.py`（逻辑层 `common/source_discovery.py`，
   自动识别 Windows 原生 / WSL / macOS / Linux；旧 `wsl_sources.sh` /
   `macos_sources.sh` 已改薄包装转发）。open 动作在 WSL 与 Windows 原生下
-  附带 `windows_path`（`path_utils.to_windows_path`），Web UI 可复制。
+  附带 `windows_path`（`common/path_utils.to_windows_path`），Web UI 可复制。
 - **跨平台读取**：文本按 `FILE_MEMORY_TEXT_ENCODINGS`（默认 utf-8-sig → gb18030）
-  降级链读取（`file_io.py`），Windows GBK 文件不再静默跳过；`file_uri` 在
+  降级链读取（`common/file_io.py`），Windows GBK 文件不再静默跳过；`file_uri` 在
   Windows 盘符路径下为合法 `file:///C:/...`，POSIX 与历史格式逐字一致
   （存量索引零失配）；Windows 下 OneDrive「仅在线」占位符默认跳过，
   防扫描触发静默下载。详见 [WEB_UI.md](WEB_UI.md)「WSL 文件索引层」与
@@ -170,7 +170,7 @@ reply ─► _filter_candidates_by_reply 三路保留:
 
 | 模块 | 说明 |
 |---|---|
-| [text_utils.py](../src/edge_cloud_agent/text_utils.py) | 中英混合切词：标点分隔 + jieba 搜索引擎模式细分（可选依赖，缺失时降级为 ≥2 字中文短语提取的旧口径），两条业务线统一 |
+| [common/text_utils.py](../src/edge_cloud_agent/common/text_utils.py) | 中英混合切词：标点分隔 + jieba 搜索引擎模式细分（可选依赖，缺失时降级为 ≥2 字中文短语提取的旧口径），两条业务线统一 |
 | embedding_runtime | `embeddinggemma-300m`；**不可用时全链路自动降级**为纯规则打分（FAISS 回退全量扫描、语义分归零），业务不中断 |
 | 存储模式 | 内存 dict + JSONL 快照；个人文件侧支持批量写（`persist=False`+`flush`）；全部 tmp + `os.replace` 原子落盘 |
 | [analytics/](../src/edge_cloud_agent/analytics/) | 复盘指标：路由埋点（`record_safe` 失败保护）→ 追加式 JSONL 事件流 → `GET /v1/metrics`；口径见 [METRICS.md](METRICS.md) |

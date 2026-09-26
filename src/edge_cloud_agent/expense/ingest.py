@@ -10,8 +10,8 @@ from threading import Event
 from .schemas import ExpenseCollectRequest
 from .service import ExpenseService
 from ..config import ExpenseConfig
-from ..file_io import read_text_with_fallback
-from ..path_utils import as_file_uri, uri_to_path
+from ..common.file_io import read_text_with_fallback
+from ..common.path_utils import as_file_uri, uri_to_path
 
 
 @dataclass

@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 
 from .cloud_client import CloudClient, CloudResult
-from .config import CloudConfig, EdgeConfig, RouteConfig
+from ..config import CloudConfig, EdgeConfig, RouteConfig
 from .edge_runtime import EdgeInferenceResult, EdgeRuntime
 from .routing import EdgeFallbackPolicy, RoutingPolicy
 

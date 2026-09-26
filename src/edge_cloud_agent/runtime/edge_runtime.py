@@ -10,7 +10,7 @@ try:
 except Exception:  # pragma: no cover
     snapshot_download = None
 
-from .config import EdgeConfig
+from ..config import EdgeConfig
 
 
 class EdgeInferenceResult:

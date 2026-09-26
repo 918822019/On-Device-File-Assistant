@@ -11,7 +11,7 @@ try:
 except Exception:  # pragma: no cover
     snapshot_download = None
 
-from .config import EmbeddingConfig
+from ..config import EmbeddingConfig
 
 
 @dataclass(frozen=True)

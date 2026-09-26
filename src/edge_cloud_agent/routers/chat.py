@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter, Request
 
-from ..agent import EdgeCloudOrchestrator, RoutingResult
-from ..schemas import ChatRequest, ChatResponse
+from ..runtime.agent import EdgeCloudOrchestrator, RoutingResult
+from .schemas import ChatRequest, ChatResponse
 
 router = APIRouter()
 

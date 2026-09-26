@@ -17,8 +17,8 @@ class _ExtractedFields(NamedTuple):
     merchant: str | None
 
 from ..config import ExpenseConfig
-from ..embedding_runtime import EdgeEmbeddingRuntime
-from ..text_utils import tokenize
+from ..runtime.embedding_runtime import EdgeEmbeddingRuntime
+from ..common.text_utils import tokenize
 from .schemas import (
     ExpenseCollectRequest,
     ExpenseCorrectRequest,

@@ -1,6 +1,6 @@
 """file_io：编码降级读取（utf-8-sig → gb18030）与二进制启发式。"""
 
-from edge_cloud_agent.file_io import (
+from edge_cloud_agent.common.file_io import (
     DEFAULT_ENCODINGS,
     looks_binary,
     parse_encodings,

@@ -26,8 +26,8 @@ from .service import PersonalFileSearchService
 from .storage import PersonalFileItem
 from .service import _now_iso
 from ..config import PersonalFileConfig
-from ..file_io import DEFAULT_ENCODINGS, parse_encodings, read_text_with_fallback
-from ..path_utils import as_file_uri
+from ..common.file_io import DEFAULT_ENCODINGS, parse_encodings, read_text_with_fallback
+from ..common.path_utils import as_file_uri
 
 
 _LOGGER = logging.getLogger("agent_server.personal_search.ingest")

@@ -1,7 +1,7 @@
 """共享分词器行为测试（jieba 口径 + 无 jieba 降级口径）。"""
 
-import edge_cloud_agent.text_utils as text_utils
-from edge_cloud_agent.text_utils import tokenize
+import edge_cloud_agent.common.text_utils as text_utils
+from edge_cloud_agent.common.text_utils import tokenize
 
 
 def test_tokenize_empty():

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from edge_cloud_agent.path_utils import (
+from edge_cloud_agent.common.path_utils import (
     as_file_uri,
     detect_platform,
     is_windows_native,

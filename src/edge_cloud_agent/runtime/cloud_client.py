@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import requests
 
-from .config import CloudConfig
+from ..config import CloudConfig
 
 
 @dataclass

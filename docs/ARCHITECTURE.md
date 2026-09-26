@@ -33,13 +33,13 @@ flowchart LR
 
 - `src/edge_cloud_agent/config.py`
   - 读取环境变量，定义三类配置：`EdgeConfig`、`CloudConfig`、`RouteConfig`、`EmbeddingConfig`、`ExpenseConfig`。
-- `src/edge_cloud_agent/routing.py`
+- `src/edge_cloud_agent/runtime/routing.py`
   - 纯策略层：负责 `edge` 与 `cloud` 的决策（不依赖外部请求服务）。
-- `src/edge_cloud_agent/agent.py`
+- `src/edge_cloud_agent/runtime/agent.py`
   - 编排器：将策略、端侧推理、云侧回退组合成一次完整路由。
-- `src/edge_cloud_agent/edge_runtime.py`
+- `src/edge_cloud_agent/runtime/edge_runtime.py`
   - 本地模型生命周期：模型选择、tokenizer 与模型加载、量化回退链路、推理与置信度估计。
-- `src/edge_cloud_agent/embedding_runtime.py`
+- `src/edge_cloud_agent/runtime/embedding_runtime.py`
   - 本地向量模型加载与 batch 推理（默认 `google/embeddinggemma-300m`）。
 - `src/edge_cloud_agent/expense/service.py`
   - 报销材料的提取、检索、导出编排。
@@ -49,7 +49,7 @@ flowchart LR
   - 报销流程三动作（收进来/找回来/拿出去）数据结构。
 - `src/edge_cloud_agent/routers/expense.py`
   - `POST /v1/expense/collect|search|export` 路由入口。
-- `src/edge_cloud_agent/cloud_client.py`
+- `src/edge_cloud_agent/runtime/cloud_client.py`
   - OpenAI 兼容接口调用，负责云端请求和响应提取。
 - `src/edge_cloud_agent/routers/chat.py`
   - 定义 `POST /v1/chat` 的 Pydantic schema 与路由处理。

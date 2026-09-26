@@ -17,7 +17,7 @@ from time import perf_counter
 
 from ..analytics import record_safe
 from ..config import PersonalFileConfig
-from ..path_utils import to_windows_path, uri_to_path
+from ..common.path_utils import to_windows_path, uri_to_path
 from ..personal_search.ingest import run_once
 from ..personal_search.schemas import (
     FileActionRequest,

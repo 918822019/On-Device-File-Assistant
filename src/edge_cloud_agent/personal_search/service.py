@@ -17,8 +17,8 @@ from time import monotonic, perf_counter
 from uuid import uuid4
 
 from ..config import PersonalFileConfig
-from ..embedding_runtime import EdgeEmbeddingRuntime
-from ..text_utils import tokenize as _tokenize
+from ..runtime.embedding_runtime import EdgeEmbeddingRuntime
+from ..common.text_utils import tokenize as _tokenize
 from .storage import FileStateStore, PersonalFileItem, PersonalFileStore
 from .schemas import FileSearchCandidate
 from .vector_index import PersonalFileVectorIndex

@@ -103,21 +103,19 @@ flowchart LR
 
 ### 模块地图
 
+包内分层（依赖方向单向：`common` ← `runtime` ← 业务线 ← `routers` ← `main`）：
+
 | 模块 | 职责 |
 |---|---|
 | `src/edge_cloud_agent/main.py` | FastAPI 入口：trace_id 中间件、统一异常、启动装配 |
-| `config.py` / `routing.py` / `agent.py` | 环境变量配置 / 纯路由策略 / 端云编排与降级 |
-| `edge_runtime.py` / `embedding_runtime.py` | 端侧 LLM 与 embedding 的加载、推理 |
-| `cloud_client.py` | 云端 OpenAI 兼容接口客户端 |
+| `config.py` | 全局环境变量配置（7 个 frozen dataclass，顶层位置不动） |
+| `common/` | 共享工具层（只依赖 stdlib）：`text_utils`（中英文分词，两条业务线统一口径）、`path_utils`（平台判定 + file URI 规范化/还原 + open 动作回传 Windows 路径）、`file_io`（编码降级链 utf-8-sig → gb18030 + 二进制启发式）、`source_discovery`（四平台索引源目录探测逻辑层，纯函数 + 依赖注入） |
+| `runtime/` | 端云推理运行时：`routing`（纯路由策略）、`agent`（端云编排与降级）、`edge_runtime`（端侧 LLM 加载/推理）、`embedding_runtime`（端侧 embedding，业务线共用）、`cloud_client`（云端 OpenAI 兼容接口客户端） |
 | `personal_search/` | 文件搜索业务线：service（检索/消歧/动作）、ingest（扫描/增量/清理）、vector_index（FAISS）、storage（JSONL）、schemas |
 | `expense/` | 报销业务线：service（抽取/检索/导出/纠正）、ingest（watch 目录）、storage、schemas |
 | `analytics/` | 复盘指标：事件流存储（追加式 JSONL）+ 指标计算（口径见 [docs/METRICS.md](docs/METRICS.md)） |
-| `routers/` | chat / embeddings / expense / personal_search 四组路由 |
+| `routers/` | chat / embeddings / expense / metrics / personal_search 五组路由 + `schemas.py`（chat/embeddings/error 的 API 模型） |
 | `web/` | Web UI（FastAPI 同源静态托管 `/web`，原生 JS 无构建；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
-| `text_utils.py` | 共享中英文分词器（两条业务线统一口径） |
-| `path_utils.py` | 跨平台路径/file URI 工具：平台判定（Windows 原生/WSL/macOS/Linux）、URI 规范化与还原、open 动作回传 Windows 路径 |
-| `file_io.py` | 跨平台文本读取：编码降级链（utf-8-sig → gb18030，Windows GBK 文件不再被跳过）+ 二进制启发式 |
-| `source_discovery.py` | 四平台索引源目录探测逻辑层（纯函数 + 依赖注入，供 scripts/sources.py 与单测使用） |
 | `scripts/sources.py` | 跨平台源目录配置助手（自动识别平台，探测常见目录多选写入 .env；`make sources`） |
 | `scripts/run.py`（+ run.bat/run.ps1） | 跨平台服务启动器（Windows 原生入口；run.sh 保留供 systemd/nohup 使用） |
 | `scripts/wsl_sources.sh` / `macos_sources.sh` | 已废弃 → 薄包装转发到 scripts/sources.py |

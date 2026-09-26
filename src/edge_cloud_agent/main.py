@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, RedirectResponse
 
-from .agent import EdgeCloudOrchestrator
+from .runtime.agent import EdgeCloudOrchestrator
 from .analytics.service import MetricsService
 from .analytics.storage import MetricsEventStore
 from .config import (
@@ -33,7 +33,7 @@ from .config import (
 )
 from .expense.service import ExpenseService
 from .expense.storage import ExpenseStore
-from .embedding_runtime import EdgeEmbeddingRuntime
+from .runtime.embedding_runtime import EdgeEmbeddingRuntime
 from .personal_search.service import PersonalFileSearchService
 from .personal_search.storage import PersonalFileStore
 from .routers.chat import router as chat_router
@@ -41,7 +41,7 @@ from .routers.embeddings import router as embeddings_router
 from .routers.expense import router as expense_router
 from .routers.metrics import router as metrics_router
 from .routers.personal_search import router as personal_search_router
-from .schemas import ErrorResponse
+from .routers.schemas import ErrorResponse
 from .expense.ingest import start_watch_loop
 from .personal_search.ingest import run_once as run_personal_scan_once, start_watch_loop as start_personal_watch_loop
 

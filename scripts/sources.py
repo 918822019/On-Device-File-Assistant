@@ -38,8 +38,8 @@ _SRC = ROOT_DIR / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from edge_cloud_agent.path_utils import detect_platform  # noqa: E402
-from edge_cloud_agent.source_discovery import (  # noqa: E402
+from edge_cloud_agent.common.path_utils import detect_platform  # noqa: E402
+from edge_cloud_agent.common.source_discovery import (  # noqa: E402
     candidates_for_platform,
     parse_selection,
     render_source_dir,

@@ -7,7 +7,7 @@
 
 import pytest
 
-from edge_cloud_agent import source_discovery as sd
+from edge_cloud_agent.common import source_discovery as sd
 
 
 def _norm(path: str) -> str:

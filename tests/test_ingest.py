@@ -275,7 +275,7 @@ def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):
 
 # ---------------- 跨平台：编码降级 / URI 规范化 / 云占位符 ----------------
 
-from edge_cloud_agent.path_utils import as_file_uri  # noqa: E402
+from edge_cloud_agent.common.path_utils import as_file_uri  # noqa: E402
 from edge_cloud_agent.personal_search import ingest as ingest_mod  # noqa: E402
 from edge_cloud_agent.personal_search.ingest import (  # noqa: E402
     _as_file_uri,
