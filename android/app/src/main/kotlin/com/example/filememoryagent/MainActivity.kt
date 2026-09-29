@@ -58,6 +58,7 @@ import com.example.filememoryagent.runtime.EdgeRuntimeService
 import com.example.filememoryagent.runtime.logging.RuntimeEventLog
 import com.example.filememoryagent.ui.ActionResult
 import com.example.filememoryagent.ui.MainViewModel
+import com.example.filememoryagent.ui.NativeInferencePanel
 import java.io.File
 import androidx.core.content.FileProvider
 
@@ -390,6 +391,7 @@ private fun ScreenContent(
     val isNeedClarify = rsp?.needsDisambiguation == true
     var shareTo by remember(rsp?.sessionId) { mutableStateOf("老王") }
     var note by remember(rsp?.sessionId) { mutableStateOf("已确认，留作证据") }
+    var showNative by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -397,6 +399,14 @@ private fun ScreenContent(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        OutlinedButton(onClick = { showNative = !showNative }) {
+            Text(if (showNative) "返回文件搜索" else "端侧模型推理")
+        }
+        if (showNative) {
+            NativeInferencePanel()
+            return@Column
+        }
+
         OutlinedTextField(
             value = state.query,
             onValueChange = onQueryChanged,

@@ -39,6 +39,7 @@ model_cache/
 # ---- Android / Gradle ----
 android/build/
 android/app/build/
+android/app/.cxx/
 android/.gradle/
 android/.kotlin/
 # 内含本机 SDK 路径，Gradle 官方要求不入库

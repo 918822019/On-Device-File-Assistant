@@ -7,13 +7,17 @@ plugins {
 android {
     namespace = "com.example.filememoryagent"
     compileSdk = 34
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.example.filememoryagent"
-        minSdk = 26
+        // Vulkan 1.1 entry points required by the DFlash graph start at API 28.
+        minSdk = 28
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+
+        ndk { abiFilters += "arm64-v8a" }
 
         buildConfigField("String", "API_BASE_URL", "\"http://10.0.2.2:9000\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -26,6 +30,13 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildFeatures {

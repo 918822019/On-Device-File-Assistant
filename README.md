@@ -183,7 +183,7 @@ flowchart LR
 - 已打通 `search → clarify → execute` 完整交互闭环与索引重建
 - 端侧能力（不依赖模型）：MediaStore 文件变更监听 + 去抖增量扫描、本地索引持久化、
   周期扫描、运行时权限引导、日志落盘 `runtime_events.log`
-- 前台服务 `EdgeRuntimeService` 目前为桩，预留端侧推理接入位
+- JNI 已链接 `third_party/tiny-llm`，可在 App 的「端侧模型推理」页导入 `.tqwen` 并按 token ID 在本机 CPU 生成；自然语言分词/解码尚未接入，文件搜索仍调用 Python 服务
 
 运行方式与目录说明见 **[android/README.md](android/README.md)**。
 
