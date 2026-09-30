@@ -43,8 +43,8 @@ def create_app() -> FastAPI:
     async def health() -> dict:
         """存活探针 + 降级可见性。
 
-        必须是 async def：本项目 22 个端点全部是同步 def，FastAPI 会把它们丢进
-        同一个 anyio 线程池（默认 40 个 token）。两个运行时加了推理锁后，并发的
+        必须是 async def：本项目 14 个端点里, 除本函数外的 13 个全部是同步 def,
+        FastAPI 会把它们丢进同一个 anyio 线程池（默认 40 个 token）。两个运行时加了推理锁后，并发的
         /v1/chat 会排队持锁，极端情况下把线程池占满；若 /health 也是同步的，
         它会被一起饿死，deploy.sh 与 service.sh 的健康门禁随即失败，systemd 会把
         一个「健康但繁忙」的服务重启掉。本函数只读 app.state，没有任何阻塞 IO，
