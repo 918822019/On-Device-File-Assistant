@@ -11,14 +11,11 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from threading import RLock
 
+from ..common.time_utils import now_iso
+
 _LOGGER = logging.getLogger("agent_server.analytics")
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -28,7 +25,7 @@ class MetricsEvent:
     payload: dict = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "MetricsEvent | None":
+    def from_dict(cls, data: dict) -> MetricsEvent | None:
         """容错构造：缺 event/ts 的历史行直接丢弃，不让整库加载失败。"""
 
         event = data.get("event")
@@ -70,7 +67,7 @@ class MetricsEventStore:
             _LOGGER.warning("metrics-event-store-load-failed: %s", exc)
 
     def append(self, event: str, payload: dict | None = None, ts: str | None = None) -> MetricsEvent:
-        record = MetricsEvent(event=event, ts=ts or _now_iso(), payload=payload or {})
+        record = MetricsEvent(event=event, ts=ts or now_iso(), payload=payload or {})
         with self._lock:
             self._events.append(record)
             if self.path:

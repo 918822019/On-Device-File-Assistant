@@ -11,8 +11,14 @@ android {
 
     defaultConfig {
         applicationId = "com.example.filememoryagent"
-        // Vulkan 1.1 entry points required by the DFlash graph start at API 28.
-        minSdk = 28
+        // minSdk 29（Android 10）：代码用到 MediaStore.Downloads、
+        // MediaStore.VOLUME_EXTERNAL_PRIMARY 与 MediaStore.Files.FileColumns.RELATIVE_PATH，
+        // 三者均为 API 29 引入。在 API 28 上它们会抛 NoClassDefFoundError /
+        // NoSuchFieldError —— 且 registerWatchObservers() 在 onCreate 里没有
+        // runCatching 包裹，RELATIVE_PATH 又出现在每次索引扫描的投影列里，
+        // 属于必崩路径而非边缘情况。
+        // DFlash 图需要的 Vulkan 1.1 入口自 API 28 起即具备，故提到 29 不影响它。
+        minSdk = 29
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"

@@ -1,6 +1,7 @@
 """Edge runtime for local embedding inference."""
 
 import logging
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -28,6 +29,8 @@ class EdgeEmbeddingRuntime:
         self.logger = logging.getLogger("edge_embedding")
         self.model = None
         self.tokenizer = None
+        # 串行化模型前向，见 embed() 内的说明。RLock 而非 Lock 的理由同 EdgeRuntime。
+        self._inference_lock = threading.RLock()
         self.model_id = self._resolve_model_id(cfg)
         self._ready = False
         self._load_model()
@@ -103,6 +106,17 @@ class EdgeEmbeddingRuntime:
 
         if isinstance(texts, tuple):
             texts = list(texts)
+
+        # 模型前向不可重入，而这个实例是被共享的：bootstrap 只构造一个
+        # EdgeEmbeddingRuntime，同时注入 expense_service 与 personal_file_service，
+        # 后台 ingest/watch 线程会和 HTTP 请求线程并发调用 embed。HF 模型对象自身
+        # 没有内部同步，并发前向会互相踩内部缓冲。故串行化。
+        # 空输入的早返回不碰模型，留在锁外，不必排在一次批量编码后面。
+        with self._inference_lock:
+            return self._embed_locked(texts, normalize)
+
+    def _embed_locked(self, texts: list[str], normalize: bool) -> EmbeddingInferenceResult:
+        """embed 的实际实现，调用方须已持有 _inference_lock。"""
 
         all_embeddings: list[list[float]] = []
         device = self.model.device

@@ -1,242 +1,63 @@
-"""Personal-file search service for disambiguation-first retrieval.
+"""Personal-file search service：检索编排、会话与文件状态。
 
-该模块定义了“搜索 -> 追问 -> 结果确认 -> 执行动作”的闭环。
-核心职责包括候选检索、候选重排、会话状态管理和动作执行日志。
+分层约定：
+- 相关性规则（线索识别、打分、过滤、重排）在 `relevance.py`
+- 澄清会话治理（TTL / 容量淘汰）在 `sessions.py`
+- 对外响应组装在 `presentation.py`
+- 索引写入与扫描在 `ingest.py`
+本模块只负责把上述能力编排成「搜索 -> 追问 -> 确认 -> 动作」的闭环，
+并管理向量索引、备注/归档等持久化状态。
 """
 
 from __future__ import annotations
+
 import logging
-import math
-import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from pathlib import Path
-from threading import RLock
-from time import monotonic, perf_counter
+from time import perf_counter
 from uuid import uuid4
 
+from ..common.text_utils import tokenize
+from ..common.time_utils import parse_iso
 from ..config import PersonalFileConfig
-from ..runtime.embedding_runtime import EdgeEmbeddingRuntime
-from ..common.text_utils import tokenize as _tokenize
-from .storage import FileStateStore, PersonalFileItem, PersonalFileStore
+from ..engines.embedding_runtime import EdgeEmbeddingRuntime
+from .presentation import to_search_candidate
+from .relevance import (
+    CLUE_COLOR_TOKENS,
+    ScoreWeights,
+    SearchCandidate,
+    decide_state,
+    dedupe,
+    extract_source_hints,
+    extract_version_hint,
+    extract_visual_hints,
+    filter_candidates_by_reply,
+    infer_source_from_path,
+    rerank_within,
+    score_item,
+)
 from .schemas import FileSearchCandidate
+from .sessions import SearchSession, SessionStore
+from .storage import FileStateStore, PersonalFileItem, PersonalFileStore
 from .vector_index import PersonalFileVectorIndex
-
-
-TIME_PATTERNS: list[tuple[re.Pattern[str], int]] = [
-    (re.compile(r"上周"), 7),
-    (re.compile(r"上个?月"), 30),
-    (re.compile(r"本周"), 7),
-    (re.compile(r"最近(\d+)?天"), 3),
-    # "明天" 不纳入时间线索：文件 captured_at 是过去时刻，"明天"作为时间约束
-    # 语义上无意义，纳入后会误匹配最近 24 小时的所有文件。
-    (re.compile(r"今天|昨日|昨天|前天"), 1),
-]
-
-_CLUE_COLOR_TOKENS = {
-    "蓝色": "blue",
-    "白色": "white",
-    "黑色": "black",
-    "红色": "red",
-    "绿色": "green",
-    "黄色": "yellow",
-    "橙色": "orange",
-    "紫色": "purple",
-    "灰色": "gray",
-}
-
-# 来源提示的 key 与 _infer_source_from_path 的返回值域（wechat/email/gallery/camera）
-# 及 doc_type（document）对齐；此前用 image/office 作 key，与任何 source_app 值都
-# 对不上，只能靠 mime/doc_type 里的子串巧合命中。
-_SOURCE_KEYWORDS = {
-    "wechat": {"微信", "weixin", "wechat", "微信好友", "微信群", "群里", "群聊"},
-    "email": {"邮箱", "email", "mail", "gmail", "outlook"},
-    "gallery": {"图库", "相册", "gallery"},
-    "camera": {"拍照", "相机", "camera", "截图", "截屏", "screenshot", "screen"},
-    "document": {"word", "excel", "ppt", "文档", "文件", "doc", "pdf"},
-}
-
-# 来源提示 -> 候选文本中的字面别名。source_app / doc_type / mime 三处值域不同
-# （如"相册"提示=gallery，而图片文件 doc_type="image"、mime="image/*"），
-# 打分与过滤两侧共用本别名表，保证口径一致。
-_SOURCE_TEXT_ALIASES = {
-    "wechat": ("wechat",),
-    "email": ("email", "mail"),
-    "gallery": ("gallery", "image"),
-    "camera": ("camera", "screenshot"),
-    "document": ("document", "office", "pdf"),
-}
-
-# 版本标记：前面不是字母数字的 v+数字（方案v2 / V4 / v1.3），或中文"版本"。
-# 不用 \b：中文语境（如"方案v2"）里 CJK 与字母间没有词边界，\bv 命不中。
-_VERSION_MARK_RE = re.compile(r"(?<![a-z0-9])v\d+(?:\.\d+)*|版本")
-
-
-def _source_hit(source_hints: list[str], text_lower: str) -> list[str]:
-    """返回在候选文本中命中的来源提示列表（经别名展开）。"""
-
-    hits: list[str] = []
-    for hint in source_hints:
-        keys = _SOURCE_TEXT_ALIASES.get(hint, (hint,))
-        if any(key in text_lower for key in keys):
-            hits.append(hint)
-    return hits
 
 _LOGGER = logging.getLogger("agent_server.personal_search")
 
+# 摘要长度：索引与展示共用的截断口径。
+_SUMMARY_MAX_CHARS = 110
 
-@dataclass
-class _SearchCandidate:
-    """内部候选结构体：原始 item + 打分 + 命中证据。"""
-
-    item: PersonalFileItem
-    score: float
-    evidence: str
-    matched_clues: list[str]
-
-
-@dataclass
-class _SearchSession:
-    """单次搜索会话上下文，保存候选和对话轮次。"""
-
-    session_id: str
-    query: str
-    candidates: list[_SearchCandidate]
-    turn: int
-    last_access: float = 0.0
-
-
-# 会话治理：30 分钟未访问自动过期；容量上限 200，超出按最久未用淘汰。
-# 此前 _sessions 只进不出，长期运行内存只增不减。
-_SESSION_TTL_SECONDS = 30 * 60.0
-_SESSION_MAX_COUNT = 200
-
-
-def _utcnow_naive() -> datetime:
-    """naive UTC now。datetime.utcnow() 在 3.12+ 已弃用，统一走这里。"""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _now_iso() -> str:
-    """返回标准 UTC 时间字符串，统一日志和存储中的时间展示。"""
-
-    return _utcnow_naive().isoformat(timespec="seconds")
-
-
-def _to_dt(value: str | None) -> datetime | None:
-    """安全转换 ISO 字符串为 datetime，失败时返回 None。"""
-
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
-
-
-# 分词统一收敛到 text_utils.tokenize（以 _tokenize 别名保持模块内调用不变）。
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """计算余弦相似度，输入向量长度不一致时用最小维度对齐。"""
-
-    if not a or not b:
-        return 0.0
-    size = min(len(a), len(b))
-    if size == 0:
-        return 0.0
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-    for i in range(size):
-        dot += a[i] * b[i]
-        norm_a += a[i] ** 2
-        norm_b += b[i] ** 2
-    if norm_a <= 0.0 or norm_b <= 0.0:
-        return 0.0
-    return dot / math.sqrt(norm_a * norm_b)
-
-
-def _clamp01(value: float) -> float:
-    """将分值限定在 0~1 区间，避免下游排序异常。"""
-
-    return max(0.0, min(1.0, value))
-
-
-def _has_time_match(captured_at: str | None, query: str) -> tuple[bool, str]:
-    """从查询文本中判断时间约束是否命中，返回匹配说明用于 evidence。"""
-
-    if not captured_at:
-        return False, ""
-
-    q = query.replace(" ", "")
-    item_time = _to_dt(captured_at)
-    if item_time is None:
-        return False, ""
-
-    now = _utcnow_naive()
-    for pattern, days in TIME_PATTERNS:
-        if pattern.search(q):
-            if days == 1 and "今天" in q and abs((now.date() - item_time.date()).days) == 0:
-                return True, "时间线索匹配: 今天"
-            if "昨天" in q and (now.date() - item_time.date()).days == 1:
-                return True, "时间线索匹配: 昨天"
-            if "前天" in q and (now.date() - item_time.date()).days == 2:
-                return True, "时间线索匹配: 前天"
-            if "上周" in q and (now - item_time) <= timedelta(days=14):
-                return True, "时间线索匹配: 上周"
-            if ("上月" in q or "上个月" in q) and (now - item_time) <= timedelta(days=45):
-                return True, "时间线索匹配: 上月"
-            # isocalendar()[:2] = (iso_year, iso_week)；只比较 week 不比较 year 会跨年误匹配
-            if "本周" in q and item_time.date().isocalendar()[:2] == now.date().isocalendar()[:2]:
-                return True, "时间线索匹配: 本周"
-            if q.startswith("最近") and "天" in q:
-                try:
-                    num = int(re.findall(r"最近(\d+)天", q)[0])
-                except Exception:
-                    num = days
-                if (now - item_time) <= timedelta(days=num):
-                    return True, f"时间线索匹配: 最近{num}天"
-                return False, ""
-            if item_time >= now - timedelta(days=days):
-                return True, f"时间线索匹配: {days}天内"
-
-    return False, ""
-
-
-def _infer_source_from_path(file_path: Path) -> str:
-    """基于文件路径做来源弱识别（wechat/微信/email/图片库等）。"""
-
-    lowered = file_path.as_posix().lower()
-    if "wechat" in lowered or "微信" in lowered or "weixin" in lowered:
-        return "wechat"
-    if "email" in lowered or "邮箱" in lowered or "mail" in lowered or "gmail" in lowered:
-        return "email"
-    if "image" in lowered or "images" in lowered or "图库" in lowered or "相册" in lowered:
-        return "gallery"
-    # "截屏" 为 macOS 中文系统截图文件名前缀（截屏2026-09-24 ….png）；
-    # "screen shot" 为旧版 macOS 英文命名（Screen Shot 2026-…），与 screenshot 并列。
-    if (
-        "camera" in lowered
-        or "截图" in lowered
-        or "截屏" in lowered
-        or "screenshot" in lowered
-        or "screen shot" in lowered
-    ):
-        return "camera"
-    return "local"
+# 视觉线索里除颜色外的高频场景词。
+_SCENE_HINT_TOKENS = ("会议", "讲", "设计", "柜子", "发票", "合同", "截图", "版本", "方案")
 
 
 class PersonalFileSearchService:
     """Personal search core service.
 
-提供三类能力：
-1. 规则 + 向量混合检索
-2. 澄清会话管理（用于继续追问）
-3. 动作执行与结构化日志记录
-"""
+    提供三类能力：
+    1. 规则 + 向量混合检索
+    2. 澄清会话管理（用于继续追问）
+    3. 文件状态（备注/归档）与动作日志
+    """
 
     def __init__(
         self,
@@ -247,8 +68,7 @@ class PersonalFileSearchService:
         self.config = config
         self.store = store
         self.embedding_runtime = embedding_runtime
-        self._sessions: dict[str, _SearchSession] = {}
-        self._session_lock = RLock()
+        self.sessions = SessionStore()
         # 备注/归档标记持久化（旧实现为内存 dict/set，重启即丢）
         self._state_store = FileStateStore(config.state_path)
         self._vector_index = PersonalFileVectorIndex(config)
@@ -262,6 +82,10 @@ class PersonalFileSearchService:
                 "store_size": len(self.store.list_all()),
             },
         )
+
+    # ------------------------------------------------------------------
+    # 向量索引
+    # ------------------------------------------------------------------
 
     @property
     def vector_index_ready(self) -> bool:
@@ -292,12 +116,27 @@ class PersonalFileSearchService:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # 索引写入侧（ingest 调用）
+    # ------------------------------------------------------------------
+
+    @property
+    def score_weights(self) -> ScoreWeights:
+        """按配置构造打分权重，负值一律归零。"""
+
+        return ScoreWeights(
+            text=max(0.0, self.config.faiss_text_weight),
+            semantic=max(0.0, self.config.faiss_semantic_weight),
+            clue=max(0.0, self.config.faiss_clue_weight),
+            version_bonus=max(0.0, self.config.faiss_version_bonus),
+        )
+
     def next_file_id(self, file_path: Path) -> str:
         normalized = file_path.as_posix().encode("utf-8", errors="ignore")
         return md5(normalized).hexdigest()[:14]
 
     def detect_source_app(self, file_path: Path) -> str:
-        return _infer_source_from_path(file_path)
+        return infer_source_from_path(file_path)
 
     def remove_by_uri(self, file_uri: str) -> None:
         self.store.delete_by_file_uri(file_uri)
@@ -314,56 +153,42 @@ class PersonalFileSearchService:
         if not text:
             return ""
         stripped = text.strip()
-        return stripped[:110] if len(stripped) > 110 else stripped
+        return stripped[:_SUMMARY_MAX_CHARS] if len(stripped) > _SUMMARY_MAX_CHARS else stripped
 
     def extract_tags(self, file_path: Path, text: str, source_app: str) -> list[str]:
         tags = [source_app]
         stem = file_path.stem.replace("_", " ").replace("-", " ").lower()
         tags.append(stem)
         if text:
-            tags.extend(_tokenize(text)[:20])
-        return sorted(set(t for t in tags if t))
+            tags.extend(tokenize(text)[:20])
+        return sorted({t for t in tags if t})
 
     def extract_visual_hints(self, file_path: Path, text: str) -> list[str]:
         hints: set[str] = set()
         stem = file_path.stem.lower()
-        for zh, en in _CLUE_COLOR_TOKENS.items():
+        for zh, en in CLUE_COLOR_TOKENS.items():
             if zh in stem or en in stem:
                 hints.add(zh)
-        for token in ("会议", "讲", "设计", "柜子", "发票", "合同", "截图", "版本", "方案"):
+        for token in _SCENE_HINT_TOKENS:
             if token in text or token in stem:
                 hints.add(token)
         return sorted(hints)
 
-    def get_session(self, session_id: str) -> _SearchSession | None:
-        with self._session_lock:
-            session = self._sessions.get(session_id)
-            if session is not None:
-                session.last_access = monotonic()
-            return session
+    # ------------------------------------------------------------------
+    # 会话
+    # ------------------------------------------------------------------
 
-    def _evict_sessions_locked(self) -> None:
-        """淘汰过期与超容会话（调用方须持有 _session_lock）。
+    def get_session(self, session_id: str) -> SearchSession | None:
+        return self.sessions.get(session_id)
 
-        惰性淘汰：在每次新建会话时执行——过期（TTL 内无访问）的直接删，
-        超容的按 last_access 最久未用删。
-        """
-
-        now = monotonic()
-        expired = [
-            sid
-            for sid, session in self._sessions.items()
-            if now - session.last_access > _SESSION_TTL_SECONDS
-        ]
-        for sid in expired:
-            del self._sessions[sid]
-        overflow = len(self._sessions) - _SESSION_MAX_COUNT
-        if overflow > 0:
-            oldest = sorted(self._sessions.items(), key=lambda kv: kv[1].last_access)[:overflow]
-            for sid, _ in oldest:
-                del self._sessions[sid]
+    # ------------------------------------------------------------------
+    # 文件状态与动作日志
+    # ------------------------------------------------------------------
 
     def get_file(self, file_id: str) -> PersonalFileItem | None:
+        return self.store.get(file_id)
+
+    def get_item(self, file_id: str) -> PersonalFileItem | None:
         return self.store.get(file_id)
 
     def _log_file_action(
@@ -423,6 +248,16 @@ class PersonalFileSearchService:
     def is_archived(self, file_id: str) -> bool:
         return self._state_store.is_archived(file_id)
 
+    def prune_file_state(self) -> int:
+        """剪掉已不在索引中的备注/归档标记，返回清理条数。
+
+        幽灵清理只删 store 里的条目，不会动状态存储，所以必须单独剪枝。
+        详见 FileStateStore.prune 的说明（file_id 由路径派生，孤儿备注会
+        在同路径出现新文件时凭空贴上去）。
+        """
+
+        return self._state_store.prune(item.file_id for item in self.store.list_all())
+
     def compare_payload(self, left_file_id: str, right_file_id: str) -> dict:
         """返回两个文件的对比建议，含推荐保留项和原因。"""
 
@@ -438,8 +273,8 @@ class PersonalFileSearchService:
             )
             raise ValueError("file_not_found")
 
-        left_time = _to_dt(left.captured_at)
-        right_time = _to_dt(right.captured_at)
+        left_time = parse_iso(left.captured_at)
+        right_time = parse_iso(right.captured_at)
         if left_time and right_time:
             newer_id = left_file_id if left_time >= right_time else right_file_id
             reason = "按 captured_at 时间优先"
@@ -448,7 +283,6 @@ class PersonalFileSearchService:
             reason = "未命中时间戳，按文件路径字典序兜底"
 
         _LOGGER.info(
-
             "personal-search-compare-built",
             extra={
                 "event": "action.compare_ok",
@@ -460,26 +294,21 @@ class PersonalFileSearchService:
         )
 
         return {
-            "left": {
-                "file_id": left.file_id,
-                "title": left.title,
-                "source_app": left.source_app,
-                "captured_at": left.captured_at,
-                "score_hint": self._match_hint_in_text(left.raw_text),
-                "archived": self.is_archived(left.file_id),
-                "note": self.get_annotation(left.file_id),
-            },
-            "right": {
-                "file_id": right.file_id,
-                "title": right.title,
-                "source_app": right.source_app,
-                "captured_at": right.captured_at,
-                "score_hint": self._match_hint_in_text(right.raw_text),
-                "archived": self.is_archived(right.file_id),
-                "note": self.get_annotation(right.file_id),
-            },
+            "left": self._compare_side(left),
+            "right": self._compare_side(right),
             "recommended_keep": newer_id,
             "recommended_reason": reason,
+        }
+
+    def _compare_side(self, item: PersonalFileItem) -> dict:
+        return {
+            "file_id": item.file_id,
+            "title": item.title,
+            "source_app": item.source_app,
+            "captured_at": item.captured_at,
+            "score_hint": self._match_hint_in_text(item.raw_text),
+            "archived": self.is_archived(item.file_id),
+            "note": self.get_annotation(item.file_id),
         }
 
     @staticmethod
@@ -488,6 +317,10 @@ class PersonalFileSearchService:
         if not text:
             return "无可检索文本"
         return text[:40]
+
+    # ------------------------------------------------------------------
+    # 检索闭环
+    # ------------------------------------------------------------------
 
     def start_search(
         self,
@@ -502,7 +335,24 @@ class PersonalFileSearchService:
         如果无需澄清直接返回 resolved。
         """
 
-        parsed_query = query[: self.config.max_search_query_len]
+        # 查询超长则截断。前端 maxlength 由 index-status 下发的 max_query_len 设置，
+        # 正常路径不会走到这里；走到说明调用方绕过了前端（curl / Android / 聊天转搜索），
+        # 故补一条 warning，让「尾部线索被丢弃」在日志里可见而不是静默发生 ——
+        # 此前的静默截断在用户侧只表现为「搜不准」，且无任何线索可查。
+        # 与本项目既有口径一致：只记长度与摘要，不记录查询原文。
+        limit = self.config.max_search_query_len
+        parsed_query = query[:limit]
+        if len(query) > limit:
+            _LOGGER.warning(
+                "personal-search-query-truncated",
+                extra={
+                    "event": "search.query_truncated",
+                    "trace_id": trace_id,
+                    "original_query_len": len(query),
+                    "limit": limit,
+                    "dropped_chars": len(query) - limit,
+                },
+            )
         query_digest = md5(parsed_query.encode("utf-8", errors="ignore")).hexdigest()[:10]
         search_id = uuid4().hex
         started = perf_counter()
@@ -521,19 +371,12 @@ class PersonalFileSearchService:
         )
 
         candidates = self._search_items(parsed_query, top_k, search_id=search_id, trace_id=trace_id)
-        state, question, should_disambiguate = self._decide_state(candidates, force_disambiguation)
-        session = _SearchSession(
-            session_id=search_id,
-            query=parsed_query,
-            candidates=candidates,
-            turn=0,
-            last_access=monotonic(),
+        state, question, should_disambiguate = decide_state(candidates, force_disambiguation)
+        self.sessions.put(
+            SearchSession(session_id=search_id, query=parsed_query, candidates=candidates)
         )
-        with self._session_lock:
-            self._evict_sessions_locked()
-            self._sessions[session.session_id] = session
 
-        response_candidates = [self._to_schema(candidate) for candidate in candidates]
+        response_candidates = [to_search_candidate(candidate) for candidate in candidates]
         _LOGGER.info(
             "personal-search-completed",
             extra={
@@ -547,7 +390,7 @@ class PersonalFileSearchService:
                 "duration_ms": round((perf_counter() - started) * 1000, 2),
             },
         )
-        return session.session_id, response_candidates, state, should_disambiguate, question
+        return search_id, response_candidates, state, should_disambiguate, question
 
     def continue_search(
         self,
@@ -581,7 +424,6 @@ class PersonalFileSearchService:
         candidates = list(session.candidates)
         selected = selected_file_id.strip() if selected_file_id else None
         normalized_reply = reply.strip() if reply else None
-        question = None
 
         _LOGGER.info(
             "personal-search-clarify-started",
@@ -610,7 +452,7 @@ class PersonalFileSearchService:
                 return (
                     session_id,
                     session.query,
-                    [self._to_schema(selected_candidate)],
+                    [to_search_candidate(selected_candidate)],
                     "resolved",
                     False,
                     None,
@@ -628,7 +470,7 @@ class PersonalFileSearchService:
 
         if normalized_reply:
             before_filter = len(candidates)
-            candidates = self._filter_candidates_by_reply(candidates, normalized_reply)
+            candidates = filter_candidates_by_reply(candidates, normalized_reply)
             _LOGGER.info(
                 "personal-search-filter",
                 extra={
@@ -649,7 +491,15 @@ class PersonalFileSearchService:
                         "reply_len": len(reply),
                     },
                 )
-                return session_id, session.query, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/群聊/颜色/场景。", None
+                return (
+                    session_id,
+                    session.query,
+                    [],
+                    "not_found",
+                    False,
+                    "没有找到可确认的文件，请再给 1~2 个线索，比如时间/群聊/颜色/场景。",
+                    None,
+                )
 
         if not candidates:
             _LOGGER.info(
@@ -663,16 +513,26 @@ class PersonalFileSearchService:
                     "duration_ms": round((perf_counter() - started) * 1000, 2),
                 },
             )
-            return session_id, session.query, [], "not_found", False, "没有找到可确认的文件，请再给 1~2 个线索，比如时间/来源/场景。", None
+            return (
+                session_id,
+                session.query,
+                [],
+                "not_found",
+                False,
+                "没有找到可确认的文件，请再给 1~2 个线索，比如时间/来源/场景。",
+                None,
+            )
 
-        candidates = self._rerank_within(candidates, normalized_reply if normalized_reply else session.query, top_k)
+        candidates = rerank_within(
+            candidates,
+            normalized_reply if normalized_reply else session.query,
+            top_k,
+            weights=self.score_weights,
+            embed_text=self.embed_text,
+        )
 
-        state, question, should_disambiguate = self._decide_state(candidates, False)
-        with self._session_lock:
-            session.turn += 1
-            session.candidates = candidates
-            session.last_access = monotonic()
-            self._sessions[session_id] = session
+        state, question, should_disambiguate = decide_state(candidates, False)
+        self.sessions.advance(session_id, candidates)
         _LOGGER.info(
             "personal-search-clarify-completed",
             extra={
@@ -689,15 +549,12 @@ class PersonalFileSearchService:
         return (
             session_id,
             session.query,
-            [self._to_schema(candidate) for candidate in candidates],
+            [to_search_candidate(candidate) for candidate in candidates],
             state,
             should_disambiguate,
             question,
             selected,
         )
-
-    def get_item(self, file_id: str) -> PersonalFileItem | None:
-        return self.store.get(file_id)
 
     def _search_items(
         self,
@@ -705,7 +562,7 @@ class PersonalFileSearchService:
         top_k: int = 6,
         search_id: str | None = None,
         trace_id: str | None = None,
-    ) -> list[_SearchCandidate]:
+    ) -> list[SearchCandidate]:
         """内部主检索流程：候选池构建 + 分值打分 + 截断返回。"""
 
         started = perf_counter()
@@ -740,10 +597,11 @@ class PersonalFileSearchService:
                 )
                 query_embedding = None
 
-        parsed_tokens = _tokenize(query)
-        source_hints = self._extract_source_hints(query)
-        visual_hints = self._extract_visual_hints(query)
-        version_hint = self._extract_version_hint(query)
+        tokens = tokenize(query)
+        source_hints = extract_source_hints(query)
+        visual_hints = extract_visual_hints(query)
+        version_hint = extract_version_hint(query)
+        weights = self.score_weights
         candidate_pool = self._select_candidates_for_scoring(
             all_items,
             query_embedding,
@@ -765,23 +623,24 @@ class PersonalFileSearchService:
                 },
             )
 
-        scored: list[_SearchCandidate] = []
+        scored: list[SearchCandidate] = []
         for item in candidate_pool:
-            score, evidence, matched = self._score_item(
+            score, evidence, matched = score_item(
                 item,
                 query,
-                parsed_tokens,
-                source_hints,
-                visual_hints,
-                version_hint,
-                query_embedding,
+                tokens=tokens,
+                source_hints=source_hints,
+                visual_hints=visual_hints,
+                version_hint=version_hint,
+                query_embedding=query_embedding,
+                weights=weights,
             )
             if score <= 0.01:
                 continue
-            scored.append(_SearchCandidate(item=item, score=score, evidence=evidence, matched_clues=matched))
+            scored.append(SearchCandidate(item=item, score=score, evidence=evidence, matched_clues=matched))
 
         scored.sort(key=lambda item: item.score, reverse=True)
-        deduped = self._dedupe(scored)[:top_k]
+        deduped = dedupe(scored)[:top_k]
         if search_id is not None:
             _LOGGER.info(
                 "personal-search-scored",
@@ -808,9 +667,9 @@ class PersonalFileSearchService:
     ) -> list[PersonalFileItem]:
         """候选池前置筛选。
 
-策略：
-- 无 embedding/向量索引时回到全量扫描；
-- 有向量索引时按 ANN 命中补齐不足项，防止召回过窄。
+        策略：
+        - 无 embedding/向量索引时回到全量扫描；
+        - 有向量索引时按 ANN 命中补齐不足项，防止召回过窄。
         """
 
         if not query_embedding or not self.vector_index_ready:
@@ -895,257 +754,3 @@ class PersonalFileSearchService:
                 },
             )
         return selected
-
-    def _rerank_within(self, candidates: list[_SearchCandidate], query: str, top_k: int) -> list[_SearchCandidate]:
-        """基于用户回复再打一次分，推动候选向真实目标收敛。
-
-        打分策略：
-        - 回复文本同时以字面线索和语义向量参与打分（此前 embedding 传 None，
-          导致 clarify 之后语义信号整体丢失）；
-        - 上一轮得分只作为低权重先验保留，避免回复线索较少时排序塌缩；
-        - 不再对旧第一名做 +1.0 硬性加分：那会突破 [0,1] 分值域，并让
-          _decide_state 的分差判定（>=0.35）几乎必然命中，追问一轮后总是
-          resolved 成旧第一名，用户补充的线索被架空。
-        """
-
-        if not candidates:
-            return []
-        parsed_tokens = _tokenize(query)
-        source_hints = self._extract_source_hints(query)
-        visual_hints = self._extract_visual_hints(query)
-        version_hint = self._extract_version_hint(query)
-        query_embedding = self.embed_text(query)
-
-        prior_weight = 0.3
-        ranked: list[_SearchCandidate] = []
-        for candidate in candidates:
-            base_score, evidence, matched = self._score_item(
-                candidate.item,
-                query,
-                parsed_tokens,
-                source_hints,
-                visual_hints,
-                version_hint,
-                query_embedding,
-            )
-            combined = _clamp01((1.0 - prior_weight) * base_score + prior_weight * candidate.score)
-            ranked.append(
-                _SearchCandidate(
-                    item=candidate.item,
-                    score=combined,
-                    evidence=f"{candidate.evidence}；{evidence}",
-                    matched_clues=sorted(set(candidate.matched_clues + matched)),
-                )
-            )
-
-        ranked.sort(key=lambda item: item.score, reverse=True)
-        return ranked[:top_k]
-
-    @staticmethod
-    def _extract_source_hints(query: str) -> list[str]:
-        normalized = query.lower()
-        source_hints: list[str] = []
-        for source, items in _SOURCE_KEYWORDS.items():
-            if any(key in normalized for key in items):
-                source_hints.append(source)
-        return source_hints
-
-    @staticmethod
-    def _extract_visual_hints(query: str) -> list[str]:
-        normalized = query.lower()
-        return [token for token in _CLUE_COLOR_TOKENS if token in normalized]
-
-    @staticmethod
-    def _extract_version_hint(query: str) -> bool:
-        q = query.replace(" ", "")
-        return "后来的" in q or "最新" in q or "版本" in q or "哪个" in q
-
-    def _text_weight(self) -> float:
-        return max(0.0, self.config.faiss_text_weight)
-
-    def _clue_weight(self) -> float:
-        return max(0.0, self.config.faiss_clue_weight)
-
-    def _semantic_weight(self) -> float:
-        return max(0.0, self.config.faiss_semantic_weight)
-
-    def _version_bonus_weight(self) -> float:
-        return max(0.0, self.config.faiss_version_bonus)
-
-    @property
-    def _score_weight_sum(self) -> float:
-        return max(
-            0.01,
-            self._text_weight() + self._semantic_weight() + self._clue_weight(),
-        )
-
-    def _decide_state(self, candidates: list[_SearchCandidate], force_disambiguation: bool) -> tuple[str, str | None, bool]:
-        """根据候选数量和分差判断是否已经 resolved。"""
-
-        if not candidates:
-            return "not_found", "没找到命中项，请再给一条时间/来源/场景线索。", False
-        if len(candidates) == 1 and not force_disambiguation:
-            return "resolved", None, False
-
-        if len(candidates) >= 2:
-            gap = candidates[0].score - candidates[1].score
-            if gap >= 0.35 and not force_disambiguation:
-                return "resolved", None, False
-
-        question = self._build_question(candidates)
-        return "needs_clarification", question, True
-
-    def _build_question(self, candidates: list[_SearchCandidate]) -> str:
-        if len(candidates) >= 3:
-            return (
-                "我找到几条可能的候选。你可以补 1-2 个线索继续确认："
-                "比如说时间（上周/昨天）、来源（微信群/邮箱）或者视觉线索（蓝色背景、聚餐、会议）。"
-            )
-        return "我有两条很接近的结果，选一个更确定的描述：例如‘5月的那张’/‘群里的那张’。"
-
-    def _filter_candidates_by_reply(self, candidates: list[_SearchCandidate], reply: str) -> list[_SearchCandidate]:
-        """按用户回复过滤候选。
-
-        除字面命中外，还识别两类最常见的自然回复线索：
-        - 时间线索（"上周的/昨天的"）：按 captured_at 匹配，字面文本里没有"上周"字样；
-        - 来源线索（"微信群里的"）：中文关键词映射到 source_app（wechat 等）再比对。
-        此前只做字面 token 匹配，这两类回复会把全部候选滤空，clarify 直接死路。
-        """
-
-        reply_lower = reply.lower()
-        reply_tokens = _tokenize(reply_lower)
-        source_hints = self._extract_source_hints(reply)
-        filtered = []
-        for candidate in candidates:
-            item = candidate.item
-            text = " ".join(
-                [
-                    item.title,
-                    item.summary,
-                    item.doc_type,
-                    item.source_app,
-                    " ".join(item.tags),
-                    " ".join(item.visual_hints),
-                ]
-            ).lower()
-            if reply_lower in text or any(token in text for token in reply_tokens):
-                filtered.append(candidate)
-                continue
-            time_hit, _ = _has_time_match(item.captured_at, reply)
-            if time_hit:
-                filtered.append(candidate)
-                continue
-            # 与 _score_item 同口径：来源提示经别名展开命中即保留
-            # （如"相册"提示=gallery，可命中 doc_type="image" 的图片文件）。
-            if _source_hit(source_hints, text):
-                filtered.append(candidate)
-        return filtered
-
-    def _score_item(
-        self,
-        item: PersonalFileItem,
-        query: str,
-        parsed_tokens: list[str],
-        source_hints: list[str],
-        visual_hints: list[str],
-        version_hint: bool,
-        query_embedding: list[float] | None,
-    ) -> tuple[float, str, list[str]]:
-        """计算单条文件与查询的综合分值与命中证据。"""
-
-        haystack = " ".join(
-            [
-                item.title,
-                item.summary,
-                item.doc_type,
-                item.source_app,
-                item.raw_text,
-                " ".join(item.tags),
-                " ".join(item.visual_hints),
-                item.file_path,
-            ]
-        ).lower()
-
-        text_hits = 0.0
-        matched: list[str] = []
-        for token in parsed_tokens:
-            if token and token in haystack:
-                text_hits += 1.0
-                matched.append(token)
-        if query.lower() in haystack:
-            text_hits += 1.5
-            matched.append("全文命中")
-
-        clue_score = 0.0
-        for source in _source_hit(source_hints, haystack):
-            clue_score += 0.8
-            matched.append(f"来源:{source}")
-
-        for visual in visual_hints:
-            if visual in haystack:
-                clue_score += 0.7
-                matched.append(f"视觉:{visual}")
-
-        time_hit, reason = _has_time_match(item.captured_at, query)
-        if time_hit:
-            clue_score += 0.7
-            matched.append(reason)
-
-        if version_hint and ("版本" in haystack or re.search(r"v\d+", item.title.lower())):
-            clue_score += 0.5
-            matched.append("版本关系")
-
-        # 仅当查询带版本意图（"最新/后来的/哪个版本"）且候选确实带版本标记
-        # （v2、v1.3、"版本"字样）时才给排序加分。
-        # 旧实现 `if "v" in haystack` 过松：任何含字母 v 的文本（video、save、
-        # csv、临时目录名）都拿 0.2 加分，与查询意图完全无关。
-        version_rank_bonus = 0.0
-        if version_hint and _VERSION_MARK_RE.search(haystack):
-            version_rank_bonus = 0.2
-
-        embed_score = 0.0
-        if query_embedding and item.embedding:
-            embed_score = _cosine_similarity(query_embedding, item.embedding)
-
-        normalized_tokens = max(1.0, len(parsed_tokens))
-        score = (
-            (text_hits / normalized_tokens) * self._text_weight()
-            + embed_score * self._semantic_weight()
-            + clue_score * self._clue_weight()
-            + version_rank_bonus * self._version_bonus_weight()
-        )
-        score = score / self._score_weight_sum
-        score = _clamp01(score)
-        evidence = "; ".join(sorted(set(matched))) if matched else "仅按语义近似"
-        return score, evidence, sorted(set(matched))
-
-    @staticmethod
-    def _dedupe(items: list[_SearchCandidate]) -> list[_SearchCandidate]:
-        seen = set()
-        deduped: list[_SearchCandidate] = []
-        for item in items:
-            if item.item.file_id in seen:
-                continue
-            seen.add(item.item.file_id)
-            deduped.append(item)
-        return deduped
-
-    @staticmethod
-    def _to_schema(item: _SearchCandidate) -> FileSearchCandidate:
-        preview = item.item.summary or item.item.raw_text[:60]
-        if not preview:
-            preview = "无可检索文本，保留文件名与来源线索"
-        return FileSearchCandidate(
-            file_id=item.item.file_id,
-            title=item.item.title,
-            source_app=item.item.source_app,
-            doc_type=item.item.doc_type,
-            mime_type=item.item.mime_type,
-            file_uri=item.item.file_uri,
-            captured_at=item.item.captured_at,
-            score=round(item.score, 4),
-            evidence=item.evidence,
-            preview=preview[:180],
-            visual_hints=item.item.visual_hints,
-            matched_clues=item.matched_clues,
-        )

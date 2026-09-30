@@ -9,10 +9,8 @@ import pytest
 
 from edge_cloud_agent.config import PersonalFileConfig
 from edge_cloud_agent.personal_search.ingest import _build_item, _file_captured_at, run_once
-from edge_cloud_agent.personal_search.service import (
-    PersonalFileSearchService,
-    _infer_source_from_path,
-)
+from edge_cloud_agent.personal_search.relevance import infer_source_from_path
+from edge_cloud_agent.personal_search.service import PersonalFileSearchService
 from edge_cloud_agent.personal_search.storage import PersonalFileStore
 
 
@@ -189,6 +187,7 @@ def test_exclude_dirs_can_be_disabled(tmp_path):
         state_path=str(tmp_path / "st.json"),
         source_dir=str(root),
         scan_exclude_dirs="",
+        scan_recursive=True,
         enable_faiss=False,
     )
     service = PersonalFileSearchService(
@@ -249,12 +248,12 @@ def test_macos_volume_junk_pruned(tmp_path):
 def test_infer_source_macos_screenshots():
     """macOS 截图文件名（中/英）应识别为 camera 来源。"""
 
-    assert _infer_source_from_path(Path("/Users/x/Desktop/截屏2026-09-24 下午3.00.00.png")) == "camera"
-    assert _infer_source_from_path(Path("/Users/x/Desktop/Screen Shot 2026-09-24 at 3.00 PM.png")) == "camera"
-    assert _infer_source_from_path(Path("/Users/x/Desktop/Screenshot 2026-09-24.png")) == "camera"
+    assert infer_source_from_path(Path("/Users/x/Desktop/截屏2026-09-24 下午3.00.00.png")) == "camera"
+    assert infer_source_from_path(Path("/Users/x/Desktop/Screen Shot 2026-09-24 at 3.00 PM.png")) == "camera"
+    assert infer_source_from_path(Path("/Users/x/Desktop/Screenshot 2026-09-24.png")) == "camera"
     # 微信沙盒路径（macOS 容器布局）仍应命中 wechat
     wx = Path("/Users/x/Library/Containers/com.tencent.xinWeChat/Data/.../MessageTemp/abc/IMG_001.png")
-    assert _infer_source_from_path(wx) == "wechat"
+    assert infer_source_from_path(wx) == "wechat"
 
 
 def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):
@@ -275,12 +274,10 @@ def test_sweep_all_roots_unreachable_no_cleanup(tmp_path):
 
 # ---------------- 跨平台：编码降级 / URI 规范化 / 云占位符 ----------------
 
+from edge_cloud_agent.common import fs_scan  # noqa: E402
+from edge_cloud_agent.common.fs_scan import is_cloud_placeholder  # noqa: E402
 from edge_cloud_agent.common.path_utils import as_file_uri  # noqa: E402
 from edge_cloud_agent.personal_search import ingest as ingest_mod  # noqa: E402
-from edge_cloud_agent.personal_search.ingest import (  # noqa: E402
-    _as_file_uri,
-    _is_cloud_placeholder,
-)
 
 
 def test_gb18030_file_indexed_end_to_end(tmp_path):
@@ -316,7 +313,7 @@ def test_build_item_encodings_from_cfg(tmp_path):
     """cfg.text_encodings 可限定编码链：仅 ascii 时中文文件降级为文件名语义。"""
 
     f = tmp_path / "中文笔记.txt"
-    f.write_bytes("正文内容".encode("utf-8"))
+    f.write_bytes("正文内容".encode())
     cfg = PersonalFileConfig(
         store_path=str(tmp_path / "s.jsonl"),
         state_path=str(tmp_path / "st.json"),
@@ -331,16 +328,20 @@ def test_build_item_encodings_from_cfg(tmp_path):
     assert item.raw_text.startswith("文件名:")
 
 
-def test_as_file_uri_delegates_to_path_utils():
-    """两处 _as_file_uri 与 path_utils.as_file_uri 单一事实源（防再漂移）。"""
+def test_ingest_modules_do_not_redefine_file_uri_helper():
+    """两侧的 `_as_file_uri` 包装已删除，调用点直接用 path_utils.as_file_uri。
 
-    from edge_cloud_agent.expense.ingest import _as_file_uri as expense_uri
+    那两个包装是纯转发（`return as_file_uri(path)`），存在的唯一作用是让
+    「URI 生成有几份实现」这个问题需要靠一条测试来盯。删掉包装之后，
+    单一事实源由导入语句本身保证，这条改为守住「不要再加回来」。
+    """
 
-    samples = [Path("/Users/x/a.png"), Path("/mnt/c/Users/x/a.png"), Path("C:/Users/x/a.png")]
-    for p in samples:
-        assert _as_file_uri(p) == as_file_uri(p)
-        assert expense_uri(p) == as_file_uri(p)
-    # Windows 盘符：合法三斜杠；POSIX：与历史格式一致
+    for mod in ("personal_search/ingest.py", "expense/ingest.py"):
+        src = (Path(__file__).resolve().parent.parent / "src/edge_cloud_agent" / mod).read_text(encoding="utf-8")
+        assert "def _as_file_uri" not in src, f"{mod} 又出现了本地 URI 包装"
+        assert "as_file_uri(" in src, f"{mod} 不再调用 path_utils.as_file_uri"
+
+    # URI 格式契约本身仍由 path_utils 的用例守住，这里只钉两个关键样本
     assert as_file_uri(Path("C:/x/a.png")) == "file:///C:/x/a.png"
     assert as_file_uri(Path("/tmp/x.txt")) == "file:///tmp/x.txt"
 
@@ -375,15 +376,15 @@ def test_is_cloud_placeholder_detection():
         def __init__(self, attrs):
             self.st_file_attributes = attrs
 
-    assert _is_cloud_placeholder(_St(0x400000)) is True   # RECALL_ON_DATA_ACCESS
-    assert _is_cloud_placeholder(_St(0x40000)) is True    # RECALL_ON_OPEN
-    assert _is_cloud_placeholder(_St(0x20)) is False      # 普通归档位
-    assert _is_cloud_placeholder(None) is False
+    assert is_cloud_placeholder(_St(0x400000)) is True   # RECALL_ON_DATA_ACCESS
+    assert is_cloud_placeholder(_St(0x40000)) is True    # RECALL_ON_OPEN
+    assert is_cloud_placeholder(_St(0x20)) is False      # 普通归档位
+    assert is_cloud_placeholder(None) is False
 
     class _PlainSt:  # 非 Windows：无 st_file_attributes 属性
         pass
 
-    assert _is_cloud_placeholder(_PlainSt()) is False
+    assert is_cloud_placeholder(_PlainSt()) is False
 
 
 def test_cloud_placeholder_skipped_on_windows(tmp_path, monkeypatch):
@@ -397,16 +398,18 @@ def test_cloud_placeholder_skipped_on_windows(tmp_path, monkeypatch):
     cloud.write_text("placeholder", encoding="utf-8")
 
     # 不能 patch 全局 os.name（pathlib 会随之实例化 WindowsPath 崩溃），
-    # 走 ingest 模块的 _is_windows 间接层
-    monkeypatch.setattr(ingest_mod, "_is_windows", lambda: True)
+    # 走 fs_scan 依赖的 path_utils.is_windows_native 间接层。
+    # 注意 patch 的是 fs_scan 命名空间里的绑定：它 `from .path_utils import
+    # is_windows_native`，patch path_utils 本身不会影响已经绑定的名字。
+    monkeypatch.setattr(fs_scan, "is_windows_native", lambda: True)
 
     class _FakeStat:
-        st_file_attributes = ingest_mod._FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        st_file_attributes = fs_scan.FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 
-    orig_safe_stat = ingest_mod._safe_stat
+    orig_safe_stat = fs_scan.safe_stat
     monkeypatch.setattr(
-        ingest_mod,
-        "_safe_stat",
+        fs_scan,
+        "safe_stat",
         lambda p: _FakeStat() if p.name == "online.txt" else orig_safe_stat(p),
     )
 

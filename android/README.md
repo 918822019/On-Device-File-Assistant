@@ -62,7 +62,7 @@
 
 ## 本机 tiny-llm 推理（token ID 模式）
 
-Android Vulkan 构建要求 minSdk 28、SDK CMake 3.22.1、NDK 27.2.12479018（含 glslc）：
+Android Vulkan 构建要求 minSdk 29、SDK CMake 3.22.1、NDK 27.2.12479018（含 glslc）：
 
 ```bash
 cd android && ./gradlew :app:assembleDebug

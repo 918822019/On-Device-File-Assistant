@@ -8,16 +8,19 @@ http://localhost:9000/          → 重定向到 /web/
 http://localhost:9000/web/      → 页面本体
 ```
 
-## 功能一览（三个 Tab）
+## 功能一览（四个 Tab）
 
 | Tab | 对接接口 | 能力 |
 |---|---|---|
 | 🔍 文件搜索 | `/v1/search-agent/*` | 首查 → 候选卡片（分值条/证据/线索 chips）→ 追问收敛或直接确认 → 打开/分享/对比/备注/归档；重建索引 |
 | 💬 端云聊天 | `/v1/chat` | 消息流 + 每条回复的路由元数据（source/reason/used_model/置信度/是否升级云端）；`force_cloud` 开关 |
 | 🧾 报销材料 | `/v1/expense/*` | 收进来（抽取结果回显+缺件提示）/ 找回来（关键词+金额日期过滤）/ 拿出去（manifest 一键复制）；watch 目录重建索引 |
+| 📈 复盘 | `/v1/metrics` | 报销回访率、搜索追问收敛率等指标 |
 
-顶栏健康灯每 30s 轮询 `/health`。页面纯静态三件套（`index.html` / `style.css` /
-`app.js`），改完刷新即生效，无需重启服务。
+顶栏健康灯每 30s 轮询 `/health`。页面为纯静态文件：`index.html` / `style.css`，
+`app.js` 是浏览器 ES module 入口；`web/js/` 分为 `core`（通用工具）、`search`、
+`chat`、`expense`、`metrics` 五个模块。无需前端构建，修改后刷新即可生效。
+模块职责与完整目录树见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
 
 高级用法：`/web/?api=http://other-host:9000` 可把页面指向另一个后端
 （跨源需要该后端自行允许 CORS；同源部署用不到）。

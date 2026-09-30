@@ -53,7 +53,7 @@ def info(message: str) -> None:
     print(f"{_PREFIX} {message}")
 
 
-def fail(message: str) -> "NoReturn":  # noqa: F821
+def fail(message: str) -> NoReturn:  # noqa: F821
     print(f"{_PREFIX}[ERROR] {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -81,6 +81,7 @@ def _xdg_lookup(key: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,  # best-effort：查不到就返回 None，不当作错误
         )
     except (OSError, subprocess.SubprocessError):
         return None

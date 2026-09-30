@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from ..personal_search.schemas import FileSearchResponse
+
 
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户输入")
     force_cloud: bool = Field(default=False, description="强制走云端")
     session_id: str | None = None
+    auto_search: bool = Field(default=True, description="先判断是否需要检索本地文件")
 
 
 class ChatResponse(BaseModel):
@@ -18,6 +21,7 @@ class ChatResponse(BaseModel):
     used_model: str
     edge_confidence: float | None = None
     text: str
+    search: FileSearchResponse | None = None
 
 
 class EmbeddingRequest(BaseModel):

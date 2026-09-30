@@ -105,7 +105,8 @@ def test_main_chdir_to_repo_root_and_launches_uvicorn(run_mod, tmp_path, monkeyp
 
 
 def test_main_rejects_non_venv_interpreter(run_mod, tmp_path, monkeypatch):
-    python = _make_python(tmp_path / ".venv" / "bin" / "python")
+    # _make_python 的返回值在此无用，需要的只是它把假解释器文件建出来的副作用
+    _make_python(tmp_path / ".venv" / "bin" / "python")
     monkeypatch.setattr(run_mod, "ROOT_DIR", tmp_path)
     monkeypatch.setattr(run_mod.os, "chdir", lambda _p: None)
     monkeypatch.setattr(run_mod, "is_venv", lambda _p: False)

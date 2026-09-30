@@ -262,6 +262,717 @@ for step_scores in scores[:window]:
 
 ---
 
+## R12. 拆分重构漏改导入，`_now_iso` 已移走但 ingest 仍在引用 → 应用完全起不来
+
+**原现象**：一次分层重构把 `_now_iso` 从 `personal_search/service.py` 移到
+`common/time_utils.py`（改名 `now_iso`），但 `personal_search/ingest.py:23` 的
+`from .service import PersonalFileSearchService, _now_iso` 没跟着改。后果是
+`import edge_cloud_agent.main` 直接 `ImportError`，**10 个模块连锁失败、8 个测试
+文件无法 collection**，应用完全无法启动。这个状态在工作区里存活了整段时间，
+因为唯一能发现它的手段（跑一次 app 或 pytest）在重构后没有执行过。
+
+**为什么没被及时发现**：项目当时**没有安装任何 linter**（`make lint` 是空桩）。
+但要注意——装上 ruff 也**发现不了**这个错误：ruff/pyflakes 只做单文件分析，
+**不跨模块解析导入**，`from .service import _now_iso` 在语法上完全合法。
+能发现它的只有类型检查器（mypy/pyright）或「把每个模块都 import 一遍」。
+考虑到引入类型检查器会给这个依赖 torch/transformers/faiss 的代码库带来海量
+基线噪音，选择了后者。
+
+**修复方式**：改用 `common.time_utils.now_iso` 的公开名（不保留 `_now_iso` 别名
+——私有下划线会掩盖「这是跨模块共享工具」这一事实），并把 8 个测试文件的导入
+指向迁移后的新家（`relevance.*` / `sessions.*` / `text_utils.tokenize`）。
+
+**防回归**：新增 `tests/test_import_smoke.py`，用 `pkgutil.walk_packages`
+逐模块 import（parametrize 形式，失败时直接显示是哪个模块），并断言
+`main.app` 能装配出 `/health` 与各条 `/v1` 路由。已证伪验证：把坏导入放回去，
+测试精确指名 `ingest.py:29`。
+
+---
+
+## R13. `config.py` 默认值与 `.env.example` 相反，新克隆会走进已弃用路径
+
+**原现象**：`.env` 被 gitignore，所以**新克隆环境跑的就是 `config.py` 的默认值**，
+而有 6 项默认值与 `.env.example`（本机验证过的正确值）相反：
+
+| 配置项 | 原默认值 | `.env.example` | 后果 |
+|---|---|---|---|
+| `EDGE_MODEL_ID` | TinyLlama-1.1B | google/gemma-4-E2B-it | 加载错误的模型 |
+| `EDGE_QUANTIZED_MODEL_ID` | TheBloke/TinyLlama-GPTQ | 空 | **打开量化会静默加载完全无关的权重** |
+| `EDGE_QUANTIZATION` | `int4-gp32` | `none` | 走进已弃用且依赖 CUDA 的 GPTQ→BNB 回退链 |
+| `EDGE_DEVICE` | `auto` | `cpu` | Apple Silicon 上落 MPS → O1 的 NaN |
+| `EDGE_EMBEDDING_TORCH_DTYPE` | `float16` | `bfloat16` | MPS+float16 输出**全 NaN 向量** |
+| `EDGE_EMBEDDING_DEVICE` | `auto` | `cpu` | 向量非确定性 → 直接污染语义检索 |
+
+最隐蔽的是第 2 项：`int4-gp32` + TinyLlama GPTQ 仓库的组合意味着新环境不只是
+「慢」或「有 NaN」，而是**加载了一个和文档宣称完全不同的模型**。
+
+代码里的注释当时已经在自相矛盾——`device` 的注释写着「本机请设为 cpu，
+详见 KNOWN_ISSUES」，而默认值偏偏是 `auto`。
+
+**修复方式**：6 项全部对齐到 `.env.example`，并把注释从「请自行覆盖」改成
+「解释默认值为何如此」。`CLOUD_MODEL_ID` 也对齐为空（尊重「云端选型未定、
+强制显式配置」的立场），同时补上 `cloud_client` 里**缺失的对称校验**——此前
+`api_base` 有清晰的中文 RuntimeError，而 `model` 完全不校验，空值会变成
+`"model": ""` 发给远端换回一个不透明的 4xx，再被 orchestrator 吞成通用降级提示。
+
+**对本机无影响**：`.env` 存在且这 6 项的值与新默认值逐字相同，故改动只影响新克隆。
+
+**防回归**：新增 `tests/test_config_env_parity.py`，用 **AST 静态解析**
+`os.getenv(KEY, default)` 的字面默认值与 `.env.example` 逐项比对
+（刻意不 import config——包 `__init__` 会 `load_dotenv()`，import 拿到的是被本机
+`.env` 覆盖后的值，恰好掩盖了要测的东西）。数值比较容忍 `0.3` vs `0.30` 这类
+纯格式差异；`ALLOWED_DIVERGENCE` 白名单当前为空，且有一条测试会在白名单条目
+恢复一致时提醒删除豁免。附带校验 `.env.example` 里每个键都真的被代码读取。
+
+---
+
+## R14. `/health` 恒绿 + 全链路静默降级 → 后端整体坏掉也无从察觉
+
+**原现象**：`bootstrap.py` 里**每一个**服务装配失败都是 `except Exception → None +
+logger.warning`（metrics、embedding runtime、expense、personal file，连 warm scan
+失败也只 warning），而 `/health` 无条件 `return {"ok": True}`。两者叠加的结果是：
+后端可以整体坏掉而外部毫无察觉。
+
+最典型的场景是 embedding runtime 加载失败——搜索会**静默退化为纯关键词匹配**，
+仍然返回 200 和看起来正常的结果，只是少了语义召回，没有任何信号提示这一点。
+
+**修复方式**：`/health` 补充 `degraded` 布尔与 `services` 明细（逐项报告
+edge_llm / embedding_runtime / personal_file_service / expense_service / metrics
+是否装配成功），但**保持 HTTP 200 且 `ok=true` 不变**。
+
+状态码不能改的原因：`deploy.sh` 与 `service.sh` 用 `curl -fsS ... | grep -q '"ok"'`
+做启动门禁，`-f` 会把 503 当成失败并死等到 `HEALTH_TIMEOUT`（900s）超时；
+`web/js/core.js` 用 `resp.ok && data.ok` 驱动状态点。
+
+`cloud_enabled` **不计入** `degraded`——它默认 false，是配置选择而非故障，
+计入会让每个默认安装恒定报告降级，告警随即失去意义。索引就绪度也不在此处，
+仍由 `/v1/search-agent/index-status` 负责。
+
+前端加 `.dot-warn` 黄点（复用已有的 `--warn` 变量），文案列出缺失的服务名，
+hover 显示完整清单。
+
+---
+
+## R15. 两个推理运行时零线程安全，并发 `/v1/chat` 会同时前向同一个模型
+
+**原现象**：`EdgeRuntime.generate()` 与 `EdgeEmbeddingRuntime.embed()` 都没有任何锁
+（对比：storage / refresh / sessions / ingest 全都用了 `Lock`/`RLock`）。而本项目
+**22 个端点全部是同步 `def`、零个 `async def`**，FastAPI 会把它们丢进同一个 anyio
+线程池（默认 40 个 token），因此两个并发 `/v1/chat` 会同时对同一个 HF 模型对象调
+`generate`。HF 模型自身没有内部同步；CPU 上也没有并行跑两个 5.1B 前向的余量，
+只会互相踩内存并把两边延迟一起拖长。
+
+embedding 侧更严重：`bootstrap` 只构造**一个** `EdgeEmbeddingRuntime` 实例并同时
+注入 `expense_service` 与 `personal_file_service`，后台 ingest/watch 线程会和 HTTP
+请求线程并发调用 `embed`。
+
+**修复方式**：两个运行时各加一把 `threading.RLock`（用 RLock 而非 Lock：当前没有
+重入路径，但万一将来 `_generate_locked` 里调用了同样持锁的方法，RLock 不会自死锁），
+实际前向逻辑拆到 `_generate_locked` / `_embed_locked`。就绪校验与空输入早返回
+**留在锁外**——模型没加载好时应立刻报错，而不是排在一次长生成后面等锁。
+
+**连带修复**：`/health` 改为 `async def`。加锁后并发 chat 会排队持锁，极端情况下
+把 40 槽的线程池占满；若 `/health` 也是同步的，它会被一起饿死 → `deploy.sh` 健康
+门禁失败 → systemd 把一个「健康但繁忙」的服务重启掉。该函数只读 `app.state`、
+没有任何阻塞 IO，跑在事件循环上即可永不被业务负载阻塞。
+
+**防回归**：新增 `tests/test_inference_concurrency.py`。运行时在 `__init__` 里就加载
+真实模型（9.5 GiB + 300 MB），无法在测试中构造，故用 `object.__new__` 绕过
+`__init__` 注入桩模型，断言 8 线程并发下的**前向并发峰值 == 1**。
+
+每个正向断言都配一条**反证**：绕过锁直接调 `*_locked` 时必须**能**并发，否则
+`peak == 1` 可能只是桩模型本身不并发、断言就是空的。（第一版测试正是栽在这里：
+helper 自带了一把 RLock，导致「把生产代码的锁换成空操作」也无法让它失败。）
+另有一条源码级断言覆盖「`__init__` 确实创建了 `_inference_lock`」——因为 helper
+绕过 `__init__`，这一行被删时其余测试全绿，而生产环境会在首次推理时 AttributeError。
+
+---
+
+## R16. FAISS 的 index 与 ids.json 错位时，`search()` 静默返回**错误的文件**
+
+**原现象**：`build()` 先写 index 文件、再写 `.ids.json`，两次独立写入之间崩溃会留下
+错位组合（典型：index 已更新为 N 个向量，ids.json 仍是上一轮的 M 条）。而
+`_load_index()` 只判断「index 存在且 ids 非空」就算就绪，`is_ready()` 里**完全没有
+长度校验**。
+
+后果比抛异常更糟：`search()` 是**按位置**把命中下标映射到 file_id 的
+（第 i 个向量 → `_ids[i]`），错位状态下 `idx >= len(self._ids)` 的守卫只跳过后半段，
+**前 M 个位置会用旧 ids 映射到新向量上**，返回的是别的文件，且不报错。
+
+另外 `_persist_ids` 直接写目标文件（非原子），而 `PersonalFileStore` 与
+`FileStateStore` 都正确使用了 tmp + `os.replace`——三个存储里只有它漏了。
+
+**修复方式**：
+1. `_persist_ids` 改为 tmp + `os.replace` 原子写，与另两个存储口径一致；
+2. `is_ready()` 把 `len(self._ids) == self._index.ntotal` 作为**硬条件**；
+3. `_load_index()` 检测到错位时记一条 `faiss.ids_mismatch` warning（含
+   `index_vectors` / `ids_count` / `index_path`，便于排查），然后判为未就绪。
+
+判为未就绪即可自愈：store 是唯一事实源，FAISS 只是可丢弃的缓存，下一轮扫描会全量
+重建。故无需引入跨两个文件的事务。
+
+**防回归**：新增 `tests/test_vector_index_consistency.py`（用 venv 里真实的
+faiss 1.10.0），构造 ids 偏短、偏长、半截 JSON 三种错位状态，断言均判为未就绪且
+`search()` 返回空而非错误结果；并验证错位可通过 rebuild 自愈、位置映射本身正确。
+已证伪：撤掉长度校验后 4 条用例失败。
+
+---
+
+## R17. ingest 稳态 IO = O(语料总字节)/轮，且 `read_bytes()` 会把整个文件读进内存
+
+**原现象**：两个问题叠加。
+
+其一，判重 hash 实现为 `md5(path.read_bytes()[:1024*1024])`——`read_bytes()` 会把
+**整个文件**读进内存**再**切片。而扫描后缀白名单里含 `.mp4` / `.mov`，一个几 GB 的
+视频就是一次几 GB 的内存分配。两条业务线各有一份完全相同的实现
+（`_short_sha1` / `_short_hash`，且名字里的 sha1 是假的，实际是 md5）。
+
+其二，这个 hash 是**变更检测键**，`run_once` 对每个发现的文件**每轮都先算 hash
+再判断有没有变**。于是稳态下每 120s 就要读一遍全量语料的前 1MB。另外
+`_sweep_deleted_files` 对每个已入库条目再做一次 `path.exists()`——在 WSL 的 9P
+跨系统调用上，这两项都是主要成本。
+
+**修复方式**：
+1. 提取到 `common/file_io.py::content_hash()`，**流式**读取（256 KiB 分块，只读
+   满 `max_bytes` 就停），消除整文件进内存；两条业务线共用一份，顺带消除重复实现。
+   输出与旧实现**逐字节等价**（同样的字节序列喂给同一个 md5），因此存量索引里的
+   `file_hash` 不会全部失配、进而触发整库重导 + 用 300M 模型重新 embedding。
+   异常口径也保持一致（任何失败返回 `""` 而不抛出，让调用方按「取不到 hash」处理，
+   而不是把该文件计成扫描错误）。
+2. 新增 **size + mtime 快路径**：`PersonalFileItem` 增加 `file_mtime_ns` 字段，
+   一次 `stat()` 同时取 size 与 mtime，两者都没变就**连 hash 都不算**。
+   稳态下每个文件从「读 1MB」降为「一次 stat」。
+3. `_build_item` 接受调用方传入已算好的 hash/size/mtime——此前变更文件会被
+   stat 两次、hash 两次（`_build_item` 内部又算了一遍）。
+4. `_sweep_deleted_files` 接受 `known_existing`（本轮 `_discover_files` 已枚举到的
+   路径集合），命中即跳过 stat。未命中时**仍回落到 `path.exists()`**：
+   `_discover_files` 只返回白名单后缀且不在排除目录里的文件，一个仍然存在、只是被
+   移出扫描范围的文件不该因此被误删，故语义与逐条 stat 完全一致。
+5. `ingest.finished` 日志新增 `rehashed` / `mtime_backfilled` / `state_pruned` /
+   `force_rehash`。`rehashed` 是本轮真正读了文件头部算 hash 的数量，稳态下应接近 0；
+   若长期等于 `scanned`，说明快路径没生效。
+
+**已知取舍（刻意保留，并被测试钉住）**：size 与 mtime 都不变的变更，快路径发现不了。
+这正是云同步/备份恢复的行为，而本项目恰好以 OneDrive/iCloud/微信目录为主要目标。
+为此 `run_once` 增加 `force_rehash` 参数：周期扫描传 False，UI 的「重建索引」按钮
+传 True 做全量权威 hash 校验，作为这种场景的显式兜底出口。
+
+**向后兼容**：旧记录没有 `file_mtime_ns`（`from_dict` 回落 None），会被当作「未知」
+而重算一次 hash，然后**就地回填元数据**（`dataclasses.replace`，不重读内容、
+不重算 embedding），下一轮即回到快路径。若不回填，这些文件会永久停留在慢路径。
+回填也计入 flush 条件，否则重启后又是一轮全量重算。
+
+**防回归**：新增 `tests/test_ingest_fastpath.py`（12 条）+ `test_file_io.py` 里的
+hash 等价性用例（覆盖空文件 / 恰好 1 MiB / 超过 1 MiB / 含 NUL 二进制）。
+三条已证伪：去掉快路径 → 4 条失败；去掉 `path.exists()` 回落 → 捕获误删场景；
+去掉 mtime 回填 → 旧记录永久慢路径。
+
+---
+
+## R18. 前端查询上限 260 vs 后端静默截断 120，尾部线索被无声丢弃
+
+**原现象**：`web/index.html` 的搜索框 `maxlength="260"`、`chat.js` 也硬编码 260，
+而后端 `FILE_MEMORY_MAX_QUERY_LEN` 默认 120，`service.start_search` 直接
+`query[:120]` **静默截断**。121~260 字符时，用户输入的尾部线索（往往正是「上周的」
+「微信群里的」这类关键限定）被丢掉，不报错、不提示，只表现为「搜不准」。
+
+**修复方式**：不采用「把两个魔数手动对齐」的做法——那只是把下一次漂移推迟到
+有人改 config 的那天。改为让上限只有**一个事实源**：
+`IndexStatusResponse` 新增 `max_query_len`（取自 cfg），`search.js` 在已有的
+`loadIndexStatus()` 里据此设置输入框 `maxLength` 并写入 `core.js` 导出的共享
+`limits` 对象，`chat.js` 改用 `limits.maxQueryLen`。`index.html` 的静态
+`maxlength` 保留为 120（与后端默认值一致），只作为首屏与后端不可达时的兜底。
+
+同时把截断从静默改为可观测：真正发生截断时记一条 `search.query_truncated`
+warning（含 `original_query_len` / `limit` / `dropped_chars`）。**只记长度不记原文**
+——本项目刻意不记录查询文本（既有日志只有 `query_digest` 与 `query_len`），
+不在此引入内容泄露。
+
+`limits` 放在 `core.js` 而非各模块自持，依赖 ES module 的 live binding；
+所有模块必须**裸引** `./core.js`，若某个模块改成 `./core.js?v=x`，浏览器模块注册表
+会把它当成另一个模块，`limits` 就会出现两份实例（search.js 写的 chat.js 看不到），
+且 cache-busting 也不会因此生效（服务端已对 `/web/` 发 `no-cache`）。
+这条约束由 `test_web_contract.py` 钉住。
+
+**防回归**：新增 `tests/test_web_contract.py`，把链路
+`index.html 静态值 == core.js limits 初值 == .env.example == config 默认值`
+整体锁住（后两者的相等由 `test_config_env_parity.py` 保证）。已证伪：把
+`maxlength` 改回 260 即失败。
+
+---
+
+## R19. Android 主启动路径两处崩溃：缺前台服务权限 + minSdk 28 撞 API 29 符号
+
+**原现象（两处都在 `onCreate` 路径上）**：
+
+1. manifest 只声明了 `FOREGROUND_SERVICE`，但 service 声明了
+   `android:foregroundServiceType="dataSync"` 且 `targetSdk 34`。Android 14 起
+   这两者必须配对，否则 `startForeground()` 抛 `SecurityException`。
+2. `minSdk = 28`，但代码用到 `MediaStore.Downloads.EXTERNAL_CONTENT_URI`、
+   `MediaStore.VOLUME_EXTERNAL_PRIMARY`（`EdgeRuntimeService.kt:156-157`）与
+   `MediaStore.Files.FileColumns.RELATIVE_PATH`（`LocalFileIndexStore.kt:153,173`），
+   三者均为 **API 29** 引入。在 Android 9 上会抛 `NoClassDefFoundError` /
+   `NoSuchFieldError`，而 `registerWatchObservers()` 在 `onCreate` 里**没有
+   `runCatching` 包裹**，`RELATIVE_PATH` 又出现在每次索引扫描的投影列里——
+   属于必崩路径而非边缘情况。文件里其它三处 `SDK_INT` 守卫
+   （TIRAMISU/M/O）都在，偏偏这几个 API 29 符号没有。
+
+**修复方式**：
+1. 补 `FOREGROUND_SERVICE_DATA_SYNC`。该权限 API 34 引入，但低版本系统会忽略
+   未知的 `uses-permission`，故无需加版本条件。
+2. `minSdk` 提到 **29**。DFlash 图需要的 Vulkan 1.1 入口自 API 28 起即具备，
+   故这一改动不影响原生推理；相比之下加 `SDK_INT` 守卫要求后续每个贡献者都记得，
+   而提高地板能永久消灭这一整类问题。顺带清掉两处因此（其实早在 minSdk 28 时就已）
+   变成死分支的守卫：`pendingIntentImmutableFlag()` 的 `SDK_INT >= M` 恒真、
+   `ensureForegroundChannel()` 的 `SDK_INT < O` 恒假。
+
+已用 `./gradlew :app:assembleDebug` 实际构建验证通过（含 manifest 合并）。
+
+---
+
+## R20. 备注/归档标记永不剪枝，同路径新文件会**继承**旧文件的备注
+
+**原现象**：幽灵清理只删 `PersonalFileStore` 里的条目，不会动 `FileStateStore`，
+所以被删文件的备注与归档标记永久残留（无界增长）。
+
+但这不只是内存问题：`file_id = "fm_" + md5(path.as_posix())[:14]`，**同一路径永远
+得到同一个 file_id**。文件被删除后若该路径上出现一个内容不同的新文件，旧备注会
+凭空贴到新文件上——用户看到的是一条与当前内容毫无关系的历史标记。
+
+**修复方式**：`FileStateStore.prune(valid_file_ids)` 剪掉不在索引中的条目，
+经 `service.prune_file_state()` 暴露；`run_once` 在 `removed > 0` 时调用，
+`force_rehash`（手工重建）时也跑一次，让升级前积累的存量孤儿有确定的清理时机。
+无变化时不落盘，避免每轮扫描都重写一次 JSON。剪枝失败被兜住并记 warning，
+不影响扫描结果（下轮还会再试）。
+
+**防回归**：`test_ingest_fastpath.py` 中 5 条用例，含直接复现上述继承场景的
+`test_new_file_at_same_path_does_not_inherit_old_annotation`。已证伪：断开接线后
+4 条失败。
+
+---
+
+## R21. 澄清 evidence 无界增长，且它直接展示在候选卡片上
+
+**原现象**：`rerank_within` 每轮做 `evidence=f"{candidate.evidence}；{evidence}"`，
+而**澄清轮数没有上限**（`turn` 只用于日志）。`evidence` 不只是内部字段——
+`web/js/search.js` 把它渲染成候选卡片上的「证据: …」，所以一次长对话会让这个
+字符串和卡片一起无限变长。
+
+**修复方式**：抽出 `_merge_evidence()`，只保留最近 `EVIDENCE_MAX_SEGMENTS`（4）段，
+被省略时以「…」开头提示证据不完整。保留最新而非最旧，因为新线索更能解释当前排序；
+完整的命中类型仍在 `matched_clues` 里（它是去重集合，不随轮数线性增长）。
+
+**防回归**：`test_rerank_evidence_does_not_grow_across_turns` 连跑 12 轮 rerank，
+断言 evidence 长度收敛而非线性增长。已证伪：改回无条件拼接即失败。
+
+---
+
+## R22. `make test` / `make install` 跑的是 PATH 上的 conda 解释器，不是项目 venv
+
+**原现象**：Makefile 用裸命令（`pytest tests/`、`pip install -r requirements.txt`），
+而本机 PATH 上的 `pytest`/`python3`/`pip` 全部解析到 `~/miniconda3/bin`。后果：
+
+- `make test` 实际跑的是 **miniconda 的 Python 3.14 + fastapi 0.139**，而
+  `requirements.txt` 钉的是 fastapi 0.116 → **4 个测试失败**，且失败原因与真实
+  运行环境无关（fastapi 0.139 起 `include_router` 不再把路由摊平进 `app.routes`，
+  而是包成惰性 `_IncludedRouter`，导致遍历 `app.routes` 找不到任何 `/v1` 路由）；
+- `make install` 会把依赖装进 conda base，污染环境。
+
+**修复方式**：Makefile 顶部解析 `$(PY)`，按 `.venv` → `$VIRTUAL_ENV`、
+`bin/python` 或 `Scripts/python.exe` 的顺序探测（与 `scripts/run.py` 同款逻辑），
+找不到才回落 `python3`。`install` / `test` / `lint` 一律走 `$(PY) -m ...`。
+`install` 同时装 `requirements-dev.txt`（否则 `make test` / `make lint` 在全新环境
+里根本跑不起来）。新增 `make check` = `lint` + `test`。
+
+顺带修掉那条被 fastapi 版本差异暴露的脆弱测试：`test_app_object_is_constructible`
+改用 `app.openapi()["paths"]` 而非遍历 `app.routes`——前者是公开契约，在 0.116 与
+0.139 下都返回同样的 14 条路径（正好对上 API.md 声称的 14 个端点）。
+
+**另**：`.venv/bin` 下所有 console script 的 shebang 都指向已不存在的
+`.venv-new/bin/python`（venv 被移动或重命名过），因此 `pip`、`accelerate`、
+`fastapi` 等脚本全部不可用；`python -m pip` 可正常工作。`$(PY) -m` 的写法顺带
+绕开了这个问题。ruff 例外——它是原生二进制，不带 shebang。
+
+---
+
+## R23. 项目没有任何 linter，`make lint` 是空桩
+
+**原现象**：`requirements-dev.txt` 只有 `pytest>=8.0`（且是全项目唯一一行没有精确
+钉版的依赖），`make lint` 的内容是 `echo "Add formatter/test checks here when needed."`。
+R12 那个坏导入能长期存活，直接原因就是这个。
+
+**修复方式**：装 `ruff==0.16.9`（精确钉版，与运行时依赖同风格），新增 `ruff.toml`，
+`make lint` 接上 `ruff check`。
+
+配置的关键在于**只开能指出真实缺陷的规则族**：ruff 0.16 的默认规则集极宽
+（A/BLE/C/D/DTZ/S/TRY/PLR/… 几乎全开），直接跑会在本项目产出上千条与刻意设计
+冲突的告警，lint 门禁随即沦为噪音而被绕过。实测：不配置时 1572 条，其中
+**1500 条是 RUF001/002/003 把中文全角标点（：，（）；）当成「歧义字符」**——
+这是中文代码库的正确写法，必须关闭。配置后 72 条真实发现，全部处理完毕。
+
+`ruff.toml` 里**每条 ignore 都写明了原因**，避免后人当成疏漏「顺手修掉」：
+`BLE001`/`S110`/`S112`（全链路静默降级是刻意设计，代价已由 R14 的 `/health`
+明细补偿）、`DTZ005`/`DTZ006`（时间戳统一 naive UTC，见 `common/time_utils.py`）、
+`SIM103`（项目一致用 guard clause 风格，折叠成 `return not (a and b)` 反而更难读）、
+`SIM105`、`SIM108`。per-file 豁免同样带理由：`vector_index.py` 的 `F821`/`UP037`
+（numpy 是可选依赖，故意在 `__init__` 的 try 块里局部导入，`np` 只出现在字符串注解中，
+且文件顶部有 `from __future__ import annotations`，注解根本不会被求值）、
+`scripts/sources.py` 的 `SIM112`（**假阳性**：Windows 环境变量字面量就是
+`%OneDrive%` 这个混合大小写，改成大写会让 OneDrive 探测直接失效）、
+`tests/*` 的 `C408`（fixture 构造器一律 `base = dict(field=value, ...)` 再
+`.update()` 后 `**base` 展开，免去键的引号且与数据类构造器签名逐字对应）。
+
+**刻意不接 `ruff format`**：它会重排 27 个文件，纯外观改动应单独成一个提交，
+不要和功能性修改混在一起。
+
+**能力边界（写进 ruff.toml 顶部与 requirements-dev.txt）**：ruff/pyflakes 只做
+单文件分析，**不跨模块解析导入**，抓不到 R12 那类错误。不要用本配置替代
+`tests/test_import_smoke.py`。
+
+顺带修掉的真实发现：`expense/service.py` 里 `class _ExtractedFields` 被插在
+**import 块中间**（5 个 E402 的根因，重构时替换动态匿名类留下的）；
+4 处 `subprocess.run` 补 `check=False` 把 best-effort 意图写明；
+`coverage.py` 的 `zip()` 补 `strict=True`（roots 与 sources 由同一列表推导而来、
+长度必须恒等，显式声明可防止将来重构把两者拆开后 zip 静默截断）；
+3 处可变类属性补 `ClassVar`；`scripts/run.py`、`sources.py` 有 shebang 却是 644，
+补可执行位；`_infer_doc_type` 死代码与孤儿 `suffix` 变量（同一处重构残留）；
+`test_personal_search.py` 里的 `_utcnow_naive` 本地副本（「now_iso 四份拷贝」之一，
+四份已全部收敛到 `common/time_utils.py`）；4 处 docstring 续行被重构压到顶格
+（用 AST 扫描全仓找出，含模块级函数——第一版扫描漏了 `col_offset == 0` 的情况）。
+
+
+---
+
+## R24. 5 份手搓的 `tmp + os.replace`，漏一处就是静默数据损坏
+
+**原现象**：原子落盘在 5 个地方各写了一遍 —— `expense/storage.py`、
+`personal_search/storage.py`（同一文件里两处：JSONL 快照与备注/归档 JSON）、
+`personal_search/vector_index.py`、`common/source_discovery.py`。
+
+代价不是行数，而是**新增站点时会漏**。这不是假设：FAISS 的 ids 边车此前就是
+直接写目标文件，直到 R16 排查错位问题时才补上原子写。读取端虽然有容错
+（坏行跳过、JSON 解析失败回落空状态），但那会把一次崩溃静默降级成「索引丢了
+一半」，比直接报错难查得多。
+
+**修复方式**：`common/file_io.py` 新增 `_atomic_tmp()` contextmanager 与
+`atomic_write_text()` / `atomic_write_lines()`，5 个站点全部改为调用它。三个要点：
+
+- `.tmp` 必须与目标**同目录**：`os.replace` 是 rename(2) 语义，跨文件系统会抛
+  EXDEV，而系统临时目录与 `data/` 往往不在同一个卷上（macOS 上 `/tmp` 还是符号链接）。
+- 异常分支要 `unlink` 残留的 `.tmp`：调用方下次成功写入虽然会覆盖同名文件，
+  但在那之前它是一个看起来像正常产物的残留，且占着磁盘配额。
+- `atomic_write_lines()` 接受**生成器**、边迭代边写。JSONL 快照每行都带
+  embedding（当前 1.2 MB / 59 条），先 `"".join(...)` 拼成一整个字符串等于把整份
+  索引在内存里再复制一份 —— 这与 R17 减少内存分配的方向相反。
+
+**一处刻意的行为变更**：`newline="\n"` 成为默认，数据文件在所有平台上都用 LF。
+此前 JSONL/JSON 走 `open("w")` 默认换行翻译，在 Windows 上会写成 CRLF，而
+`.env` 早就显式写了 `newline="\n"`。所有读取端都是换行无关的（逐行 `strip()`
+后 `json.loads`、或 `read_text` 后解析），因此不改变任何解析结果；macOS/Linux
+上字节完全不变。
+
+**防回归**：`tests/test_common_primitives.py`，含「写入中途失败时目标文件保持
+旧内容」「失败后不留 `.tmp`」「`.tmp` 必须与目标同目录」。已证伪：把 `os.replace`
+换成 `shutil.copyfile` → 同目录断言失败；去掉 `except` 分支的 `unlink` → 残留
+断言失败。
+
+**生产验证**：对真实的 `data/personal_file_store.jsonl`（1199311 字节 / 59 条）
+调用 `flush()`，落盘后**逐字节不变**。
+
+顺带：`.gitignore` 补 `/tmp/` 与 `/prefixcache/`（仓库根两个空的运行时目录，
+仓内无任何代码引用，应是在仓库根跑 tiny-llm 二进制时落的；Git 不跟踪空目录，
+所以它们平时不出现在 `git status` 里，一旦有产物写入就会立刻变成待提交内容）。
+
+---
+
+## R25. 两份 `cosine_similarity`，而阈值是按同一个口径调出来的
+
+**原现象**：`personal_search/relevance.py:113` 与 `expense/service.py:352`
+是两份逻辑逐行相同的实现 —— 连「输入长度不一致时按最小维度对齐」这个并不显然
+的取舍都一样，只差 `<= 0.0` 与 `<= 0` 的写法。
+
+风险不在于行数，而在于**只会改一份**。两条业务线的相似度分数各自喂给按同一
+口径调出来的阈值：personal 侧的 0.7/0.3 新旧分融合权重（R21）、expense 侧的
+命中判定。一旦有人只在一边调整了归一化或零向量兜底，两条线的分数会静默分叉，
+而阈值不会报错 —— 只会表现为「报销搜索突然变得很松/很紧」。
+
+**修复方式**：抽到 `common/vectors.py`，两处调用点改引用。刻意保持纯 Python
+循环而不换 numpy：embedding 是 768 维、单次查询只算几十条候选，numpy 的 import
+与数组构造开销远大于计算本身；更重要的是 numpy 在本项目是**可选依赖**
+（见 `vector_index` 的局部导入约定），`common/` 不能依赖它。
+
+**防回归**：8 例参数化（同向/正交/反向/非单位向量/空向量/零向量/长度不一致）
++ 尺度不变性，另有 `test_both_business_lines_share_one_cosine_implementation`
+断言 `relevance.cosine_similarity is common.vectors.cosine_similarity`，并扫源码
+确认两个业务模块里不再出现本地定义。已证伪：在 `relevance.py` 里重新定义一份
+→ 该测试失败。
+
+---
+
+## R26. 两个 store 是逐字符几乎相同的两份实现，而修复只落在一边
+
+**原现象**：`PersonalFileStore` 与 `ExpenseStore` 有 **10 个同名同形方法**
+（`__init__` / `_load` / `_persist` / `add_or_update` / `flush` / `get` /
+`get_by_file_uri` / `list_all` / `get_many` / `delete_by_file_uri`），
+`_load` 与 `_persist` 几乎逐字符一致。两者真正的差异只有三点：行类型、主键
+字段名（`file_id` vs `material_id`）、以及 expense 多两个业务查询。
+
+最实际的后果不是行数，而是**修一边忘另一边**。R20 那一轮给 personal 侧补的
+「同一 id 换了 URI 时清理旧二级索引键」，expense 侧就没有：改过来源文件的报销
+材料会在 `_by_file_uri` 里留下悬空键 —— 按旧 URI 查得到，`delete_by_file_uri`
+删的却是新 URI，旧键永远留着。
+
+**修复方式**：`common/jsonl_store.py` 的 `JsonlSnapshotStore[RowT]`。子类只声明
+三个类属性（`row_type` / `id_attr` / `index_attr`）加业务专属查询
+（`list_by_claim`、`all_claim_ids`）；公开的 `get_by_file_uri` /
+`delete_by_file_uri` 保留为一行委托，调用方（ingest、service、路由）零改动。
+
+顺带统一掉的三处不一致，都是**更严的那一边胜出**：
+
+1. expense 的 `_load` 不校验空主键，空 id 的行会全部挤在 `""` 键上互相覆盖；
+   现在两条线都丢弃这类行。
+2. expense 的 `add_or_update` 不清理悬空索引键（即上述原现象）；现在清理。
+3. `PersonalFileStore.get_many` 的循环变量叫 `material` —— 从 expense 抄过来
+   的残留，正好是「两份拷贝」的物证。
+
+`_persist` 里先 `list(self._items.values())` 拷贝一份再序列化：
+`atomic_write_lines` 是边迭代边写的，直接传 `values()` 视图的话，任何并发写入
+都会让迭代抛 `RuntimeError: dictionary changed size during iteration`。所有
+写方法确实都持锁，但**读方法刻意不持锁**（快照语义下读到的是稍旧但自洽的视图，
+加锁会让检索热路径与后台扫描的落盘互相阻塞），所以这个隐患不能靠「调用方守
+规矩」来关。拷贝一次的代价相对逐行 `json.dumps` 可以忽略。
+
+**行数说明（不美化）**：两个 store 合计 405 行 → 251 行，加上新增的 170 行基类，
+净增 16 行。收益不是更短，而是**持久化语义从此只有一处定义**。
+
+**防回归**：32 例，含 6 线程并发写 300 行后落盘完整、坏行跳过不丢其余记录、
+空主键丢弃、悬空键清理、「旧键若已被别的 id 占用则不得误删」、
+`persist=False` + `flush()` 只落盘一次、20 次连续写入不留 `.tmp`。
+已证伪 7 项全部被抓到：去掉悬空键清理、去掉空主键守卫、坏行改为抛出、
+`_persist` 丢掉 `ensure_ascii=False`、失败不清理 `.tmp`、原子写退化为
+`copyfile`、业务线重新 fork 一份 cosine。
+
+其中一项**第一次没抓到**，值得记下来：`ensure_ascii` 的断言原本写在直接测
+`atomic_write_lines` 的用例里，根本没经过 `_persist`。补了
+`test_store_persists_utf8_not_ascii_escapes` 钉住 store 自己的序列化口径 ——
+这个退化是静默的（`json.loads` 两种都吃），只会让中文标题从 3 字节 UTF-8
+膨胀成 6 字节 `\uXXXX`，1.2 MB 的快照平白涨一截，且再也没法用编辑器直接看。
+
+**生产验证**：真实 59 条记录 `from_dict`/`to_dict` 往返 0 失配，59 条
+`file_uri` 二级索引全部可查，`flush()` 后逐字节不变。
+
+---
+
+## R27. `runtime/` 兼容垫片是一份只为让自己继续存在而存在的代码
+
+**原现象**：`src/edge_cloud_agent/runtime/` 是 6 个文件、共 30 行的纯 re-export。
+`src/` 与 `scripts/` 对它**零引用**，唯一使用者是 `tests/test_architecture_layers.py`
+里验证垫片自身可用的 3 条断言 —— 即一份只被「证明它还活着」的测试养着的代码。
+
+**判断依据**：这次分层重构尚未提交，`edge_cloud_agent.runtime.*` 从来没有作为
+已发布路径存在过，因此没有真实的兼容对象。保留它的成本是结构性的：
+`docs/PROJECT_STRUCTURE.md` 要为它多解释一行，读代码的人要花时间确认
+「engines 和 runtime 哪个才是真的」。
+
+**修复方式**：整目录删除。模块数 56 → 52，`test_import_smoke.py` 的数量哨兵
+同步上调（`>= 50` → `>= 52`，否则删完刚好卡在阈值上、余量为零）。
+
+**防回归**：`test_legacy_runtime_shim_is_gone` 同时断言目录不存在**且**
+`__import__("edge_cloud_agent.runtime")` 抛 ImportError。前者挡文件被恢复，
+后者挡有人通过 `sys.modules` 或 `.pth` 把这个路径重新塞回来。
+
+---
+
+## R28. 层边界此前只有文档、没有任何机器校验
+
+**原现象**：`docs/PROJECT_STRUCTURE.md` 写着依赖方向
+`routers → agents / personal_search / expense → llm / engines → common`，
+但没有任何东西保证它成立。`test_import_smoke.py` 只能发现「模块坏了」，
+发现不了「依赖错了方向」—— 层边界破了不会有任何报错，只会在几个月后表现为
+「改 `common/` 要跑全量测试」「某个业务模块删不掉」这类说不清来源的成本。
+
+**修复方式**：`test_architecture_layers.py` 改为用 AST 静态扫全仓 import
+（相对导入按 `level` 还原成绝对路径），把**当前实际存在**的 15 条跨包依赖边
+固化成 `ALLOWED_EDGES` 白名单：
+
+```text
+routers          → agents, analytics, common, engines, expense, personal_search
+agents           → llm, personal_search
+personal_search  → analytics, common, engines
+expense          → common, engines
+analytics        → common
+llm              → engines
+engines          → （无）
+common           → （无）
+```
+
+选白名单而不是「禁止某几个方向」：新增任何一条边都会红，逼出一次显式决定，
+而不是让新依赖悄悄混进来。用 AST 而非运行时 import 追踪，是因为静态扫描连
+**未使用**的 import 也算，`# noqa: F401` 绕不过去。
+
+另有 `test_documented_edges_still_exist` 做反向校验：白名单里已经消失的边必须
+删掉，否则它会慢慢变成一份过期的架构图 —— 而一份看起来权威其实过期的架构图，
+比没有架构图更误导人。
+
+**顺带发现**：当前实际依赖图里有一条文档没写的边 —— `personal_search → analytics`
+（`search_flow.py:7` 的 `from ..analytics import record_safe`，首轮检索埋点）。
+它不违反方向（业务层之间、且 analytics 只依赖 common），已补进白名单与
+`docs/PROJECT_STRUCTURE.md` 的依赖方向说明。
+
+**已证伪 4 项**：让 `common/` 反向依赖 `routers`、白名单里留一条过期边、
+恢复 `runtime/` 垫片、让 `personal_search` 直接依赖 `routers` —— 全部被抓到。
+
+
+---
+
+## R29. expense 的摄取循环是 personal 侧的一份**旧快照**，四项修复只落在一边
+
+**原现象**：`expense/ingest.py` 与 `personal_search/ingest.py` 有 7 处同形构造
+（`IngestResult`、`_as_file_uri`、`_discover_files`、`_read_text_*`、
+`_sweep_deleted_*`、`run_once` 骨架、`start_watch_loop`）。与 R26 的 store 一样，
+问题不是行数，而是 **personal 侧后来修的东西 expense 侧一个都没有**：
+
+| 能力 | personal 侧 | expense 侧（改前） |
+|---|---|---|
+| 目录遍历 | `os.walk` + 原地剪枝，`followlinks=False` | `rglob("*")`，**无法跳过整棵子树** |
+| 变更检测 | size + mtime_ns 快路径，稳态 0 字节内容读取 | 每个文件每轮读头部 1 MB 算 md5 |
+| 幽灵清理 | 复用本轮枚举结果，命中即跳过 `stat` | 每条已入库记录一次 `stat` |
+| 并发保护 | `_SCAN_LOCK` 串行化 | **无锁** |
+| 单文件失败 | 计入 `errors` + 记日志，继续 | 只有 `collect()` 被 try 包住，`stat`/`hash` 阶段的异常掀掉整轮 |
+
+`rglob("*")` 那条尤其讽刺：personal 侧的注释里正是为此改掉它的 ——
+「WSL 下跨 9P 扫 `/mnt/c` 时 `node_modules`/`AppData` 级目录会让扫描成本爆炸」。
+而 expense 的 watch 循环默认**每 120 秒跑一次**，也就是说这份 O(watch 目录总字节)
+的 IO 是持续发生的，不是一次性的。
+
+无锁那条是真并发缺陷：`run_once` 有两个入口（watch 线程与 `/v1/expense/rebuild-index`），
+「读 existing → 判定 → 写」这个复合操作不是原子的，store 自己的锁保护不到它。
+
+**修复方式**：抽出两个业务无关的 `common/` 模块，两侧共用同一份实现：
+
+- `common/fs_scan.py`：`iter_files()`（遍历 + 剪枝 + 后缀过滤 + 云占位符门控 + 排序）、
+  `fingerprint()` / `is_unchanged()`（size + mtime_ns 变更检测）、
+  `reachable_roots()` / `owning_root()` / `is_ghost()`（按根可达的幽灵判定）
+- `common/watch_loop.py`：`IngestResult` + `run_watch_loop()`
+
+expense 侧因此一次性拿到全部五项能力，并新增 `ExpenseMaterial.file_mtime_ns`
+（`from_dict` 用 `.get()`，存量 JSONL 向后兼容；缺失时按「未知」处理，重算一次
+hash 后就地回填）。`/v1/expense/rebuild-index` 同步改为传 `force_rehash=True`，
+与 personal 侧的「重建索引」语义对齐。
+
+顺带删掉两处**纯转发**的 `_as_file_uri()` 包装（`return as_file_uri(path)`）——
+它们存在的唯一作用是让「URI 生成有几份实现」这个问题需要靠一条测试来盯。
+
+**防回归**：`tests/test_fs_scan.py`（30 例）+ `tests/test_expense_ingest.py`
+新增 13 例。共做了 13 项变异：**11 项当场被抓到** —— 去掉 expense 快路径、
+`force_rehash` 不再绕过、去掉 mtime 回填、幽灵清理不再复用扫描结果、per-file try
+失效、去掉扫描锁、`is_ghost` 去掉 `path.exists()` 回落、`iter_files` 改为遍历后
+过滤、不再排序、后缀比较不再小写归一、expense 不写 `file_mtime_ns`；
+**1 项是测试漏洞**（下述第 1 条，已补）；**1 项是语义等价的变异**（下述第 3 条，
+不是漏洞）。R30 另有 5 项。
+
+其中**两条第一次没抓到**，都是测试本身的问题，记下来：
+
+1. `from_dict` 丢掉 `file_mtime_ns` 时，原有的内存态用例全绿 —— 同一进程内
+   第二轮扫描用的是完整的内存对象，只有**重启后的第一轮**会退回慢路径。
+   补了 `test_file_mtime_ns_survives_a_jsonl_roundtrip`：从同一路径重新构造
+   store 与 service，断言重启后第一轮仍然 0 次 hash。补完再变异即被抓到。
+2. 我写的 `test_sweep_still_removes_a_file_that_left_the_scan_scope` 前提是错的：
+   把 `m.txt` 改名成 `m.bin` 之后，记录里的旧 URI 指向的路径**确实不存在了**，
+   清理它是正确行为。真正要防的是「文件仍在磁盘、只是本轮没被枚举到」
+   （后缀被移出白名单、或移进排除目录）。已改写为改 `watch_file_suffixes`，
+   并补一条改名的对照组 `test_sweep_removes_record_whose_path_really_is_gone`。
+
+还有一条**证伪脚本自身**的坑值得单独记：第一版把测试名写成裸函数名而不是完整
+node id，pytest 收集不到任何用例（`no tests ran in 0.00s`），却因退出码非 0 被
+判成「抓到了」—— 14 条**全部是假阳性**，看起来完美。改成完整 node id、并在每次
+变异**之前先跑一遍基线确认该用例真的存在且是绿的**之后，才暴露出上面两个真漏洞。
+
+另有一条变异是**语义等价的**，不是测试漏洞：`is_unchanged` 里
+`recorded_mtime_ns is None` 的显式守卫被后面的相等比较覆盖（`None == <int>`
+恒为 False）。穷举 256 组 `None`/`int` 输入，删掉守卫后行为差异 0 处。保留它是
+为了把「未知 ≠ 没变」这条不变量写在代码里，已在 docstring 中注明它当前是冗余的。
+
+---
+
+## R30. 两个 watch 循环都是 `except Exception: pass`，守护线程的持续失败完全静默
+
+**原现象**：两侧 `start_watch_loop` 是同一段十行代码：
+
+```python
+while not stop_event.is_set():
+    try:
+        run_once(service, cfg)
+    except Exception:
+        pass          # ← 连一行日志都没有
+    stop_event.wait(delay)
+```
+
+watch 循环是索引保持新鲜的**唯一自动机制**。它一旦持续失败（源目录权限变了、
+store 落盘失败、embedding 运行时挂了），外部看到的现象只是「新文件搜不到」——
+与 R14「`/health` 恒绿」是同一类可观测性幻觉，而且更隐蔽：连降级路径都没走到，
+`/health` 的 `services` 明细里也不会体现，因为服务本身是就绪的。
+
+**修复方式**：`common/watch_loop.run_watch_loop()` 统一循环骨架：
+
+- `tick` 抛异常**永不打断循环**（否则一次偶发错误就让索引永久停更），但每次
+  失败都记一条 warning，含异常类型名、`consecutive_failures`、`total_failures`
+- 连续失败计数在成功一轮后归零 —— 「偶发一次」与「一直在坏」必须能区分开
+- 起止各记一条 info（`loop_started` 带 `interval_seconds`，`loop_stopped` 带
+  `ticks` 与 `total_failures`）。此前守护线程是否活着，在日志里完全看不出来
+- 只记异常**类型名**不记 message：消息里常带完整文件路径，与项目「日志不落
+  用户内容」的口径冲突（同 `ingest.item_failed`）
+- `interval <= 0` 夹到 1 秒下限并记 warning。`Event.wait(0)` 立即返回，配上一个
+  永不 set 的 `stop_event` 就是 100% CPU 的忙等循环，而 `*_INTERVAL_SECONDS`
+  是环境变量，写错成 0 不会有任何报错。正的小数（测试与快速轮询）不受影响
+
+各业务模块的 `start_watch_loop` 保留原签名（`bootstrap.py` 零改动），只负责把
+自己的 `run_once` 与命名传进去。**串行锁没有上移**：它要保护的是 store 与向量
+索引的写入，而 `run_once` 有多个入口（watch 线程、`/search` 节流刷新、
+`/rebuild-index`），只有包在 `run_once` 里才覆盖得到全部。
+
+**顺带修掉一处结构问题**：`personal_search/ingest.py` 里有个私有 `_is_windows()`
+（`return os.name == "nt"`），是 `common/path_utils.is_windows_native()` 的
+**第三份**平台判定拷贝，而且更弱 —— 后者支持 `FILE_MEMORY_WINDOWS_NATIVE_PATH_MAP`
+覆盖，那是非 Windows 机器上测试 Windows 分支的唯一入口。现统一走 `path_utils`，
+并由 `test_platform_predicate_is_shared_with_path_utils` 用 AST 钉住
+（不能用字符串搜索：`fs_scan` 的 docstring 里为说明这段历史提到了 `os.name`，
+第一版就是这么假阳的）。
+
+**防回归**：`tests/test_watch_loop.py`（18 例）。已证伪 5 项：回到
+`except: pass`、不夹取非正 interval、异常打断循环、记 message 而非类型名、
+连续计数不归零。
+
+其中「记 message 而非类型名」第一次没抓到：我断言的是 `record.getMessage()`，
+而那是固定消息串 `watch-loop-tick-failed`，extra 载荷不在里面。但 extra **会**被
+上一轮加的 `_ExtraFormatter` 渲染进真实日志输出 —— 也就是说这条泄漏在生产日志里
+是真的，只是我的测试看不见。改为直接断言 `record.exception`。
+
+---
+
+## R31. `IngestResult.material_ids` 在 personal 侧装的是 file_id，而它是 wire 契约
+
+**原现象**：两份 `IngestResult` 副本字段完全相同，都叫 `material_ids` ——
+personal 侧那份是照抄 expense 留下的名字，装的其实是 `file_id`
+（`material_ids.append(item.file_id)`）。这个名字还一路漏进了 HTTP 响应：
+`RebuildIndexResponse.material_ids`。
+
+**为什么不能直接改名**：Android 客户端用
+`@SerializedName("material_ids")` 钉住了这个 wire 名
+（`android/app/src/main/kotlin/com/example/filememoryagent/model/ApiModels.kt:123`）。
+改字段名不会报错，只会让客户端**静默拿到空列表** —— Gson 对未知字段是忽略而非报错。
+
+**修复方式**：内部名改为业务中性的 `imported_ids`，wire 名保持 `material_ids`，
+映射发生在 routers 层（两个端点各一行 + 注释说明为什么不能改）。
+`IngestResult` 收敛为 `common/watch_loop.py` 里的单一定义，两侧共用。
+
+**未做的事**：没有动 wire 字段名。要改就得同时发一版 Android 并处理旧客户端，
+收益（API 命名准确）不足以抵这个协调成本。`docs/API.md` 与两处 schema 的注释
+已写明这个历史包袱。
+
+
+---
+
 # 二、未修复
 
 ## O1. transformers 5.x 的 SDPA 在 MPS 上产出 NaN 且非确定性 ⚠️ 最重要
@@ -470,3 +1181,33 @@ embedding（file_id 不变，备注不丢，属一次性成本）；POSIX 平台
 `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1`，需重启）。
 **不引入** `\\?\` 前缀方案：会改变 file_path/file_uri/file_id 字面值，
 破坏索引稳定性（见 O11）。
+
+---
+
+## O13. 指标事件流无界增长，但**不能**简单按时间/条数压缩
+
+`MetricsEventStore` 是追加式 JSONL + 同步维护的内存列表，`_load()` 在启动时读入
+全部历史，`append()` 永不淘汰，`list_all()` 每次复制整个列表。没有任何轮转或压缩。
+
+**为什么暂不修**：`docs/METRICS.md` 定义的指标里，`revisit_rate`（14d 窗口）与
+`followup_completion_rate`（1h 窗口）是有窗口的，但 `corrections_total`、
+`clarify_resolve_rate`、`clarify_exec_rate` 是**全时段累计**。因此任何「丢弃 N 天前
+事件」的压缩策略都会**静默改变这三个已文档化指标的口径**——报表数字会变，
+而使用者不会收到任何提示。这比无界增长本身更糟。
+
+同时只限制内存而不限制文件也不解决问题：文件仍会无限增长，启动时的全量读取
+（以及读取耗时）照旧。要真正约束磁盘就得引入轮转（保留 `.1` 世代），而那同样会
+让累计指标失去早期数据。
+
+**当前实际风险很低**：`data/metrics_events.jsonl` 目前是 6.3 KB 量级；即使增长
+1000 倍到 6 MB，启动加载也在亚秒级，内存占用可忽略。
+
+**若将来确需约束，可选方案（按侵入性递增）**：
+1. 把三个累计指标改为**显式窗口口径**（如「近 90 天」），同步更新 METRICS.md，
+   然后才能安全地按窗口压缩事件流；
+2. 引入可配置的 `METRICS_MAX_EVENTS`（默认 0 = 不限制，保持现有语义），
+   超限时丢弃最旧事件并记 warning 说明累计指标现在只覆盖较短窗口；
+3. 事件流轮转 + 归档文件离线聚合（把累计计数沉淀为快照，而非依赖全量事件）。
+
+无论选哪种，都必须**先改文档口径、再改代码**，并在 `/v1/metrics` 响应里暴露
+实际覆盖的时间范围，让口径变化对使用者可见。

@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+
+from .file_io import atomic_write_text
 
 Exists = Callable[[str], bool]
 Readable = Callable[[str], bool]
@@ -426,7 +428,7 @@ def update_env_file(env_path: str | Path, key: str, value: str) -> bool:
 
     与 deploy.sh / wsl_sources.sh 的 env_set 语义一致（避免"首个/末个生效"
     在 run.sh 与 python-dotenv 之间打架）。值不加引号（Windows 反斜杠在
-    dotenv 双引号值里会被转义）。原子写：tmp + os.replace。
+    dotenv 双引号值里会被转义）。原子写口径统一走 common.file_io。
     返回是否发生了替换（False = 追加或新建）。
     """
 
@@ -442,8 +444,5 @@ def update_env_file(env_path: str | Path, key: str, value: str) -> bool:
             replaced = True
     if not replaced:
         lines.append(f"{key}={value}")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = env_path.with_name(env_path.name + ".tmp")
-    tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp_path, env_path)
+    atomic_write_text(env_path, "\n".join(lines) + "\n")
     return replaced

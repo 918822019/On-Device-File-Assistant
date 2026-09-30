@@ -4,21 +4,17 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
-from typing import Iterable, NamedTuple
+from datetime import datetime
+from typing import NamedTuple
 from uuid import uuid4
 
-
-class _ExtractedFields(NamedTuple):
-    """collect() 字段抽取结果，替代每次调用都动态创建的匿名类。"""
-    amount: float | None
-    date: str | None
-    merchant: str | None
-
-from ..config import ExpenseConfig
-from ..runtime.embedding_runtime import EdgeEmbeddingRuntime
 from ..common.text_utils import tokenize
+from ..common.time_utils import now_iso, parse_iso
+from ..common.vectors import cosine_similarity
+from ..config import ExpenseConfig
+from ..engines.embedding_runtime import EdgeEmbeddingRuntime
 from .schemas import (
     ExpenseCollectRequest,
     ExpenseCorrectRequest,
@@ -26,6 +22,14 @@ from .schemas import (
     ExpenseSearchRequest,
 )
 from .storage import ExpenseMaterial, ExpenseStore
+
+
+class _ExtractedFields(NamedTuple):
+    """collect() 字段抽取结果，替代每次调用都动态创建的匿名类。"""
+
+    amount: float | None
+    date: str | None
+    merchant: str | None
 
 
 _TOKEN_RE = re.compile(r"[\s,，。；;:：!！?？\\-_/\\|()（）【】、]+")
@@ -54,11 +58,6 @@ _MERCHANT_PATTERNS = [
 ]
 
 
-def _now_iso() -> str:
-    # utcnow() 在 3.12+ 已弃用；保持 naive UTC 输出格式与存量数据一致
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-
-
 def _safe_float(value: str) -> float | None:
     try:
         parsed = float(value.replace(",", ""))
@@ -67,15 +66,6 @@ def _safe_float(value: str) -> float | None:
     except Exception:
         return None
     return None
-
-
-def _safe_parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
 
 
 def _required_doc_types(config: ExpenseConfig) -> list[str]:
@@ -89,13 +79,18 @@ class SearchResult:
 
 
 class ExpenseService:
-    def __init__(self, config: ExpenseConfig, store: ExpenseStore, embedding_runtime: EdgeEmbeddingRuntime | None) -> None:
+    def __init__(
+        self,
+        config: ExpenseConfig,
+        store: ExpenseStore,
+        embedding_runtime: EdgeEmbeddingRuntime | None,
+    ) -> None:
         self.config = config
         self.store = store
         self.embedding_runtime = embedding_runtime
 
     def collect(self, req: ExpenseCollectRequest, claim_id: str, persist: bool = True) -> ExpenseMaterial:
-        now = _now_iso()
+        now = now_iso()
         extracted = self._extract_fields(req.raw_text)
         keywords = self._extract_keywords(req.raw_text, req.doc_type, req.source_app, req.notes)
         title = req.title or self._build_title(req.doc_type, extracted, keywords)
@@ -116,6 +111,7 @@ class ExpenseService:
             file_uri=req.file_uri,
             file_hash=req.file_hash,
             file_size_bytes=req.file_size_bytes,
+            file_mtime_ns=req.file_mtime_ns,
             notes=req.notes,
             keywords=keywords,
             created_at=now,
@@ -143,7 +139,7 @@ class ExpenseService:
                 continue
             if getattr(material, field_name) != new_value:
                 changes[field_name] = new_value
-        updated = replace(material, **changes, updated_at=_now_iso())
+        updated = replace(material, **changes, updated_at=now_iso())
         self.store.add_or_update(updated)
         return updated, list(changes)
 
@@ -201,7 +197,7 @@ class ExpenseService:
             materials = []
         export_id = uuid4().hex
         lines = [f"报销材料导出清单 {export_id}"]
-        lines.append(f"生成时间：{_now_iso()}")
+        lines.append(f"生成时间：{now_iso()}")
         lines.append(f"材料数量：{len(materials)}")
         lines.append("")
 
@@ -270,6 +266,10 @@ class ExpenseService:
                 return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
             if len(match.groups()) == 2:
                 month, day = match.groups()
+                # 刻意用本地时间而非全项目的 naive UTC 口径：这里补的是
+                # **单据上的日历日期**（"9月30日" 这类无年份写法）的年份，
+                # 用户指的是自己所在时区的历法年。两者只在跨年那几个小时
+                # 窗口内有差别，但那种时候用 UTC 年恰好是错的。
                 now = datetime.now()
                 return f"{now.year:04d}-{int(month):02d}-{int(day):02d}"
         return None
@@ -328,11 +328,11 @@ class ExpenseService:
 
     @staticmethod
     def _within_date(candidate: str | None, from_date: str | None, to_date: str | None) -> bool:
-        candidate_dt = _safe_parse_datetime(candidate)
+        candidate_dt = parse_iso(candidate)
         if candidate_dt is None:
             return not from_date and not to_date
-        begin = _safe_parse_datetime(from_date)
-        end = _safe_parse_datetime(to_date)
+        begin = parse_iso(from_date)
+        end = parse_iso(to_date)
         if begin and candidate_dt < begin:
             return False
         if end and candidate_dt > end:
@@ -349,24 +349,6 @@ class ExpenseService:
             total += material.extracted_amount
             count += 1
         return round(total, 2) if count else None
-
-    @staticmethod
-    def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        if not a or not b:
-            return 0.0
-        size = min(len(a), len(b))
-        if size == 0:
-            return 0.0
-        dot = 0.0
-        norm_a = 0.0
-        norm_b = 0.0
-        for i in range(size):
-            dot += a[i] * b[i]
-            norm_a += a[i] ** 2
-            norm_b += b[i] ** 2
-        if norm_a <= 0 or norm_b <= 0:
-            return 0.0
-        return dot / math.sqrt(norm_a * norm_b)
 
     def _score(self, material: ExpenseMaterial, keyword: str, query_embedding: list[float] | None) -> float:
         if not keyword and query_embedding is None:
@@ -394,6 +376,6 @@ class ExpenseService:
 
         embed_score = 0.0
         if query_embedding is not None and material.embedding:
-            embed_score = self._cosine_similarity(query_embedding, material.embedding)
+            embed_score = cosine_similarity(query_embedding, material.embedding)
 
         return round((keyword_score / max(1, len(tokens))) * 0.7 + embed_score * 0.3, 4)

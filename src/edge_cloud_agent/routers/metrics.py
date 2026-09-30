@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
+from . import deps
+
 router = APIRouter()
 
 
@@ -15,7 +17,7 @@ def get_metrics(request: Request):
     比率字段在分母为 0 时为 null（样本不足），不以 0.0 冒充。
     """
 
-    metrics = getattr(request.app.state, "metrics", None)
+    metrics = deps.metrics(request)
     if metrics is None:
         raise HTTPException(status_code=503, detail="指标服务未就绪")
     return metrics.compute()

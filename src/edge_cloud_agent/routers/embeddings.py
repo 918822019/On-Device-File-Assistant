@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..runtime.embedding_runtime import EdgeEmbeddingRuntime
+from ..engines.embedding_runtime import EdgeEmbeddingRuntime
 from .schemas import EmbeddingRequest, EmbeddingResponse
 
 router = APIRouter()

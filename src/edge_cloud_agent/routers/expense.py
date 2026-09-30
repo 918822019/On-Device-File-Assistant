@@ -2,63 +2,32 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, HTTPException, Request
 
-from ..analytics import record_safe
+from ..common.time_utils import now_iso
 from ..config import ExpenseConfig
+from ..expense.ingest import run_once
+from ..expense.presentation import export_material, extraction_confidence
 from ..expense.schemas import (
     ExpenseCollectRequest,
     ExpenseCollectResponse,
     ExpenseCorrectRequest,
     ExpenseCorrectResponse,
-    ExpenseRebuildIndexResponse,
     ExpenseExportRequest,
     ExpenseExportResponse,
-    ExpenseExportMaterial,
+    ExpenseRebuildIndexResponse,
+    ExpenseSearchHit,
     ExpenseSearchRequest,
     ExpenseSearchResponse,
-    ExpenseSearchHit,
 )
-from ..expense.ingest import run_once
-from ..expense.service import ExpenseService
-from ..expense.storage import ExpenseMaterial
-
+from . import deps
 
 router = APIRouter()
 
 
-def _extraction_confidence(material: ExpenseMaterial) -> float:
-    """金额/日期/商户三个抽取字段的命中占比（0~1）。
-
-    旧实现 `1.0 if material.summary else 0.0` 恒为 1.0（summary 永不为空），
-    是假指标；现在反映真实抽取质量，也是复盘指标"字段纠正次数"的分母参照。
-    """
-
-    signals = (
-        material.extracted_amount is not None,
-        bool(material.extracted_date),
-        bool(material.merchant),
-    )
-    return round(sum(signals) / len(signals), 2)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-
-
-def _record(request: Request, method_name: str, *args) -> None:
-    """复盘指标埋点：服务未装配或记录失败都静默跳过，绝不影响业务响应。"""
-
-    record_safe(getattr(request.app.state, "metrics", None), method_name, *args)
-
-
 @router.post("/v1/expense/collect", response_model=ExpenseCollectResponse)
 def collect(req: ExpenseCollectRequest, request: Request):
-    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    service = deps.expense_service(request)
 
     cfg: ExpenseConfig = request.app.state.expense_cfg
     claim_id = req.claim_id or cfg.default_claim_id
@@ -69,7 +38,7 @@ def collect(req: ExpenseCollectRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"收集材料失败: {exc}") from exc
 
     claim_total, claim_count, missing_types = service.build_claim_summary(claim_id=material.claim_id)
-    _record(
+    deps.record_metric(
         request,
         "record_expense_collect",
         material.claim_id,
@@ -86,7 +55,7 @@ def collect(req: ExpenseCollectRequest, request: Request):
         extracted_date=material.extracted_date,
         merchant=material.merchant,
         summary=material.summary,
-        extraction_confidence=_extraction_confidence(material),
+        extraction_confidence=extraction_confidence(material),
         needs_follow_up=bool(missing_types),
         missing_required_types=missing_types,
         claim_material_count=claim_count,
@@ -96,9 +65,7 @@ def collect(req: ExpenseCollectRequest, request: Request):
 
 @router.post("/v1/expense/search", response_model=ExpenseSearchResponse)
 def search(req: ExpenseSearchRequest, request: Request):
-    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    service = deps.expense_service(request)
     try:
         items = service.search(req)
     except Exception as exc:  # pragma: no cover
@@ -123,7 +90,7 @@ def search(req: ExpenseSearchRequest, request: Request):
     missing_types: list[str] = []
     if req.claim_id:
         _, _, missing_types = service.build_claim_summary(req.claim_id)
-    _record(request, "record_expense_search", req.claim_id)
+    deps.record_metric(request, "record_expense_search", req.claim_id)
     return ExpenseSearchResponse(
         keyword=req.keyword,
         claim_id=req.claim_id,
@@ -133,41 +100,26 @@ def search(req: ExpenseSearchRequest, request: Request):
     )
 
 
-def _build_export_material(material: ExpenseMaterial) -> ExpenseExportMaterial:
-    return ExpenseExportMaterial(
-        material_id=material.material_id,
-        claim_id=material.claim_id,
-        title=material.title,
-        doc_type=material.doc_type,
-        extracted_amount=material.extracted_amount,
-        extracted_date=material.extracted_date,
-        merchant=material.merchant,
-        file_uri=material.file_uri,
-    )
-
-
 @router.post("/v1/expense/export", response_model=ExpenseExportResponse)
 def export(req: ExpenseExportRequest, request: Request):
-    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    service = deps.expense_service(request)
     claim_id = req.claim_id
     export_id, manifest, materials = service.export_bundle(req)
     if not materials:
         raise HTTPException(status_code=404, detail="未找到可导出的材料")
-    if not claim_id and materials:
+    if not claim_id:
         claim_id = materials[0].claim_id
 
-    _record(request, "record_expense_export", claim_id, len(materials))
+    deps.record_metric(request, "record_expense_export", claim_id, len(materials))
     return ExpenseExportResponse(
         export_id=export_id,
         claim_id=claim_id,
         material_count=len(materials),
         export_filename=f"expense_export_{claim_id or 'manual'}_{export_id}.txt",
-        # 旧值取 materials[0].updated_at（材料更新时间），与字段语义不符；改为真实导出时刻
-        export_time=_now_iso(),
+        # 真实导出时刻；刻意不复用材料的 updated_at
+        export_time=now_iso(),
         manifest=manifest,
-        materials=[_build_export_material(material) for material in materials],
+        materials=[export_material(material) for material in materials],
     )
 
 
@@ -175,9 +127,7 @@ def export(req: ExpenseExportRequest, request: Request):
 def correct(req: ExpenseCorrectRequest, request: Request):
     """人工纠正抽取字段；实际改动计入复盘指标「字段纠正次数」。"""
 
-    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    service = deps.expense_service(request)
     try:
         material, changed = service.correct(req)
     except KeyError as exc:
@@ -186,7 +136,7 @@ def correct(req: ExpenseCorrectRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"纠正失败: {exc}") from exc
 
     if changed:
-        _record(request, "record_expense_correct", material.claim_id, material.material_id, changed)
+        deps.record_metric(request, "record_expense_correct", material.claim_id, material.material_id, changed)
     return ExpenseCorrectResponse(
         material_id=material.material_id,
         claim_id=material.claim_id,
@@ -201,13 +151,14 @@ def correct(req: ExpenseCorrectRequest, request: Request):
 
 @router.post("/v1/expense/rebuild-index", response_model=ExpenseRebuildIndexResponse)
 def rebuild_index(request: Request):
-    service: ExpenseService | None = getattr(request.app.state, "expense_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="报销服务未就绪，请检查数据存储/配置后重启服务。")
+    service = deps.expense_service(request)
 
     cfg: ExpenseConfig = request.app.state.expense_cfg
     try:
-        result = run_once(service, cfg)
+        # force_rehash=True：与 personal_search 的「重建索引」同一语义 —— 手工
+        # 重建要做权威的 hash 校验，绕过 size+mtime 快路径。云同步/备份恢复可能
+        # 把 mtime 还原成旧值，那种变更只有重算 hash 能发现。
+        result = run_once(service, cfg, trace_id=deps.trace_id(request), force_rehash=True)
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"重建索引失败: {exc}") from exc
 
@@ -217,5 +168,5 @@ def rebuild_index(request: Request):
         skipped=result.skipped,
         errors=result.errors,
         removed=result.removed,
-        material_ids=result.material_ids,
+        material_ids=result.imported_ids,
     )

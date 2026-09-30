@@ -261,17 +261,14 @@ class EdgeRuntimeService : LifecycleService() {
     }
 
     private fun pendingIntentImmutableFlag(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_IMMUTABLE
-        } else {
-            0
-        }
+        // FLAG_IMMUTABLE 自 API 23 起可用，且 API 31+ 强制要求显式指认可变性；
+        // minSdk 已是 29，原先的 SDK_INT >= M 判断恒真，故直接返回。
+        return PendingIntent.FLAG_IMMUTABLE
     }
 
     private fun ensureForegroundChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return
-        }
+        // NotificationChannel 自 API 26 起必需；minSdk 已是 29，
+        // 原先的 SDK_INT < O 提前返回恒不成立，故移除该分支。
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL,

@@ -51,12 +51,18 @@ python scripts\sources.py             & rem 交互选择要索引的目录（--p
 python scripts\run.py                 & rem 或 scripts\run.bat；浏览器直开 http://127.0.0.1:9000/web/
 ```
 
-跑测试（业务层 165 例单测，纯规则逻辑，**不需要模型权重**）：
+跑测试（业务层与接口回归测试，**不需要模型权重**）：
 
 ```bash
-pip install -r requirements-dev.txt
-pytest tests/
+make install    # 装运行时 + 开发依赖到项目 venv
+make check      # ruff 静态检查 + pytest（无需模型权重）
 ```
+
+> 用 `make` 而不是裸 `pip` / `pytest`：PATH 上的裸命令可能指向 conda 等其它
+> 解释器。本机实测裸 `pytest` 会跑 miniconda 的 Python 3.14 + fastapi 0.139，
+> 而 `requirements.txt` 钉的是 fastapi 0.116，结果与真实运行环境不一致
+> （`make install` 走裸 `pip` 还会把包装进 conda base）。Makefile 里的 `$(PY)`
+> 会按 `.venv` → `$VIRTUAL_ENV` 的顺序解析，与 `scripts/run.py` 同款逻辑。
 
 完整步骤（embedding 权重下载、云端启用、常见报错排查）见
 **[docs/QUICKSTART.md](docs/QUICKSTART.md)**。
@@ -103,23 +109,27 @@ flowchart LR
 
 ### 模块地图
 
-包内分层（依赖方向单向：`common` ← `runtime` ← 业务线 ← `routers` ← `main`）：
+完整目录树与新增代码放置约定见 [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)。
+
+包内分层（`engines` 承担推理，`llm` 负责端云策略和生成编排，`agents` 组合检索与对话业务，`routers` 只做 HTTP 适配）：
 
 | 模块 | 职责 |
 |---|---|
 | `src/edge_cloud_agent/main.py` | FastAPI 入口：trace_id 中间件、统一异常、启动装配 |
 | `config.py` | 全局环境变量配置（7 个 frozen dataclass，顶层位置不动） |
-| `common/` | 共享工具层（只依赖 stdlib）：`text_utils`（中英文分词，两条业务线统一口径）、`path_utils`（平台判定 + file URI 规范化/还原 + open 动作回传 Windows 路径）、`file_io`（编码降级链 utf-8-sig → gb18030 + 二进制启发式）、`source_discovery`（四平台索引源目录探测逻辑层，纯函数 + 依赖注入） |
-| `runtime/` | 端云推理运行时：`routing`（纯路由策略）、`agent`（端云编排与降级）、`edge_runtime`（端侧 LLM 加载/推理）、`embedding_runtime`（端侧 embedding，业务线共用）、`cloud_client`（云端 OpenAI 兼容接口客户端） |
+| `common/` | 共享工具层（只依赖 stdlib）：`text_utils`（中英文分词，两条业务线统一口径）、`path_utils`（平台判定 + file URI 规范化/还原 + open 动作回传 Windows 路径）、`file_io`（编码降级链 utf-8-sig → gb18030 + 二进制启发式 + 流式 `content_hash` + `atomic_write_text/lines`）、`time_utils`（全项目唯一的 naive UTC 时间口径）、`vectors`（`cosine_similarity`）、`jsonl_store`（`JsonlSnapshotStore`：两条业务线共用的 JSONL 快照存储基类）、`fs_scan`（目录遍历与剪枝 + 变更指纹 + 幽灵记录判定）、`watch_loop`（后台摄取循环骨架 + `IngestResult`）、`source_discovery`（四平台索引源目录探测逻辑层，纯函数 + 依赖注入） |
+| `engines/` | 端侧模型引擎：`edge_runtime`（本地 LLM 加载/推理）、`embedding_runtime`（向量模型加载/推理，两条业务线共用） |
+| `llm/` | LLM 编排：`routing`（端云策略）、`orchestrator`（端云调用/降级）、`cloud_client`（OpenAI 兼容云端客户端） |
+| `agents/` | Agent 业务层：`chat` 决定何时查本地文件、何时请求 LLM，输出与 HTTP 无关的结果 |
 | `personal_search/` | 文件搜索业务线：service（检索/消歧/动作）、ingest（扫描/增量/清理）、vector_index（FAISS）、storage（JSONL）、schemas |
 | `expense/` | 报销业务线：service（抽取/检索/导出/纠正）、ingest（watch 目录）、storage、schemas |
 | `analytics/` | 复盘指标：事件流存储（追加式 JSONL）+ 指标计算（口径见 [docs/METRICS.md](docs/METRICS.md)） |
-| `routers/` | chat / embeddings / expense / metrics / personal_search 五组路由 + `schemas.py`（chat/embeddings/error 的 API 模型） |
-| `web/` | Web UI（FastAPI 同源静态托管 `/web`，原生 JS 无构建；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
+| `routers/` | chat / embeddings / expense / metrics / personal_search 五组 HTTP 适配器 + `schemas.py`（chat/embeddings/error 的 API 模型） |
+| `web/` | Web UI（`index.html` / `style.css` + `app.js` ES module 入口；`js/` 按搜索、聊天、报销、指标分模块；WSL 访问见 [docs/WEB_UI.md](docs/WEB_UI.md)） |
 | `scripts/sources.py` | 跨平台源目录配置助手（自动识别平台，探测常见目录多选写入 .env；`make sources`） |
 | `scripts/run.py`（+ run.bat/run.ps1） | 跨平台服务启动器（Windows 原生入口；run.sh 保留供 systemd/nohup 使用） |
 | `scripts/wsl_sources.sh` / `macos_sources.sh` | 已废弃 → 薄包装转发到 scripts/sources.py |
-| `tests/` | 业务层单测（165 例） |
+| `tests/` | 单测（业务层 + 结构性回归：导入冒烟、架构层边界、config/.env 一致性、Web 前后端契约、推理并发串行化、共享存储原语）；当前用例数用 `make test` 查看 |
 | `android/` | Android MVP 客户端（Kotlin + Compose，见 [android/README.md](android/README.md)） |
 
 ---
@@ -142,6 +152,7 @@ flowchart LR
 | `POST /v1/search-agent/clarify` | 追问消歧（时间/来源/字面线索均可） |
 | `POST /v1/search-agent/execute` | 命中动作：open / share / compare / annotate / archive |
 | `POST /v1/search-agent/rebuild-index` | 手动重建文件索引 |
+| `GET /v1/search-agent/index-status` | 查看索引覆盖范围与扫描深度 |
 | `GET /v1/metrics` | 复盘指标（报销回访/补齐/纠正 + 搜索追问收敛漏斗） |
 
 ---
@@ -192,17 +203,37 @@ flowchart LR
 ## 测试
 
 ```bash
-pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 165 例，无需模型权重
+make install    # 运行时 + 开发依赖（pytest、ruff）装进项目 venv
+make check      # = make lint + make test；无需模型权重
 ```
+
+`make lint` 跑 `ruff check`，规则与豁免理由集中在 `ruff.toml`（每条 ignore 都注明
+了为什么，避免后人当成疏漏「顺手修掉」）。`make test` 与 `make lint` 都走 venv 里的
+解释器，不受 PATH 上 conda 等其它 Python 影响。
 
 覆盖：共享分词（jieba 口径与无 jieba 降级口径）、时间线索匹配、状态判定、
 澄清重排收敛（回归：reply 可翻盘、分值不越界）、回复过滤（时间/来源线索）、
 报销字段抽取（金额/日期/商户）、JSONL 存储往返与容错、增量扫描生命周期
 （导入/跳过/变更重导/删除清理）、多根源目录与排除剪枝（WSL/macOS/Windows
 索引层）、跨平台路径/file URI 规范化与还原（新旧格式兼容、幽灵清理回归）、
-编码降级读取（GBK/BOM/二进制）、四平台源目录探测与 .env 写入、跨平台启动器。
-平台相关用例全部经 monkeypatch/依赖注入模拟，任意 OS 上均可运行。
+编码降级读取（GBK/BOM/二进制）、四平台源目录探测与 .env 写入、跨平台启动器、
+云端客户端（配置校验与响应解析）。
+
+另有一组**结构性回归**，专门盯那些不会被业务用例覆盖、却能让整个服务起不来的问题：
+
+| 测试 | 防的是什么 |
+|---|---|
+| `test_import_smoke.py` | 任何模块 import 失败。ruff/pyflakes 不跨模块解析导入，抓不到「`from .x import` 已被移走的符号」—— 这类错误曾让 `main` 连锁失败、应用完全起不来 |
+| `test_config_env_parity.py` | `config.py` 默认值与 `.env.example` 漂移。`.env` 被 gitignore，所以新克隆跑的就是默认值；漂移意味着行为与文档相反且无任何报错 |
+| `test_web_contract.py` | 前端硬编码的查询长度上限与后端不一致（曾长期 260 vs 120，超出部分被静默截断） |
+| `test_inference_concurrency.py` | 两个模型运行时的前向被并发调用（端点全是同步 `def`，共享同一个 anyio 线程池） |
+| `test_architecture_layers.py` | 跨包依赖方向被破坏。层边界破了不会报错，只会在几个月后表现为「改 `common/` 要跑全量测试」这类说不清来源的成本；AST 静态扫，连未使用的 import 也算 |
+| `test_common_primitives.py` | 原子写、余弦、JSONL 快照基类退化。这三处现在承载两条业务线的全部持久化与全部相似度打分，退化是静默的（坏行被跳过、`\uXXXX` 照样能 `json.loads`） |
+| `test_fs_scan.py` | 目录扫描退化：排除目录变成「遍历后过滤」而非剪枝（结果相同、代价差几个数量级）、符号链接环让后台线程挂死、`mtime` 缺失被判成「没变」导致存量记录永远发现不了内容变更 |
+| `test_watch_loop.py` | 后台摄取循环的失败重新变成静默。这是索引保持新鲜的唯一自动机制，它坏了只会表现为「新文件搜不到」 |
+
+平台相关用例全部经 monkeypatch/依赖注入模拟，任意 OS 上均可运行；模型运行时用
+`object.__new__` 绕过 `__init__` 注入桩模型，故不需要下载权重。
 
 ---
 
@@ -232,6 +263,7 @@ pytest tests/                          # 165 例，无需模型权重
 
 | 文档 | 内容 |
 |---|---|
+| [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) | 仓库目录树与模块职责约定 |
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | 安装、权重下载、启动、云端启用、FAQ |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Linux 服务器部署：一键脚本、systemd、服务管理、排错 |
 | [docs/WEB_UI.md](docs/WEB_UI.md) | Web 页面功能说明与 WSL 部署（localhost 转发 / 镜像网络 / systemd） |

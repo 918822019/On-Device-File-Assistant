@@ -30,6 +30,12 @@ class CloudClient:
                 "CLOUD_API_BASE 未配置。启用云端（CLOUD_ENABLED=true）时必须显式指定 "
                 "OpenAI 兼容接口地址。"
             )
+        model = (self.cfg.model or "").strip()
+        if not model:
+            raise RuntimeError(
+                "CLOUD_MODEL_ID 未配置。启用云端（CLOUD_ENABLED=true）时必须显式指定 "
+                "透传给 OpenAI 兼容接口的 model 字段。"
+            )
 
         headers = {
             "Content-Type": "application/json",
@@ -38,7 +44,7 @@ class CloudClient:
             headers["Authorization"] = f"Bearer {self.cfg.api_key}"
 
         payload = {
-            "model": self.cfg.model,
+            "model": model,
             "messages": messages,
             "max_tokens": self.cfg.max_new_tokens,
             "temperature": self.cfg.temperature,

@@ -1,6 +1,8 @@
 """Edge runtime for local tiny LLM inference."""
 
 import logging
+import threading
+from typing import ClassVar
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -55,8 +57,8 @@ class _ConfidenceRecorder:
 class EdgeRuntime:
     """TinyLLM edge runtime with quantization fallback chain."""
 
-    _QUANT_DIRECT_MODES = {"int4", "int4-gp32", "gp32", "gptq", "gptq-int4"}
-    _GPTQ_MODES = {"gptq", "int4-gp32", "gp32", "gptq-int4"}
+    _QUANT_DIRECT_MODES: ClassVar[set[str]] = {"int4", "int4-gp32", "gp32", "gptq", "gptq-int4"}
+    _GPTQ_MODES: ClassVar[set[str]] = {"gptq", "int4-gp32", "gp32", "gptq-int4"}
     # 置信度只看前若干步的 max-softmax，与原 _estimate_confidence 的 window=6 保持一致
     _CONFIDENCE_WINDOW = 6
 
@@ -65,6 +67,10 @@ class EdgeRuntime:
         self.logger = logging.getLogger("edge_runtime")
         self.model = None
         self.tokenizer = None
+        # 串行化模型前向，见 generate() 内的说明。用 RLock 而非 Lock：当前没有
+        # 重入路径，但万一将来 _generate_locked 里调用了同样持锁的方法，
+        # RLock 不会自死锁。
+        self._inference_lock = threading.RLock()
 
         self.model_id = self._resolve_model_id(cfg)
         # 用于响应展示的稳定模型 ID；self.model_id 可能是本地路径（EDGE_LOCAL_DIR）
@@ -226,6 +232,17 @@ class EdgeRuntime:
             raise RuntimeError("Edge tokenizer/model missing")
 
         generation_tokens = max_new_tokens or self.cfg.max_new_tokens
+
+        # 模型前向不可重入：所有端点都是同步 def，FastAPI 把它们丢进同一个 anyio
+        # 线程池（默认 40 个 token），因此并发 /v1/chat 会同时对同一个 HF 模型对象
+        # 调 generate。HF 模型自身没有内部同步；CPU 上也没有并行跑两个 5.1B 前向
+        # 的余量，只会互相踩内存并把两边延迟一起拖长。故在此串行化。
+        # 就绪校验留在锁外：模型没加载好时应立刻报错，而不是排在一次长生成后面。
+        with self._inference_lock:
+            return self._generate_locked(messages, generation_tokens)
+
+    def _generate_locked(self, messages: list[dict], generation_tokens: int) -> EdgeInferenceResult:
+        """generate 的实际实现，调用方须已持有 _inference_lock。"""
 
         if hasattr(self.tokenizer, "apply_chat_template"):
             prompt = self.tokenizer.apply_chat_template(

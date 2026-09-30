@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>端上文件助手 · 端云结合 Agent</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=health-warn-1">
 </head>
 <body>
 <header class="topbar">
@@ -31,11 +31,19 @@
 <main>
   <!-- ==================== 文件搜索 ==================== -->
   <section id="tab-search" class="tab-panel active">
+    <div class="panel index-overview">
+      <div class="overview-heading">
+        <div><h2>本地文件搜索</h2><p>先看已收录范围，再用文件名、主题或来源找回原件。</p></div>
+        <button id="refresh-index-status" class="btn btn-ghost btn-sm" type="button">刷新状态</button>
+      </div>
+      <div id="index-overview-body" class="overview-content" aria-live="polite">读取索引状态中…</div>
+    </div>
     <div class="panel">
       <div class="search-row">
-        <input id="sq" type="text" maxlength="260" placeholder="模糊口述，例如：上周群里发的聚餐照片" autocomplete="off">
-        <button id="search-btn" class="btn btn-primary">搜索</button>
-        <button id="rebuild-file-btn" class="btn btn-ghost" title="重新扫描 FILE_MEMORY_SOURCE_DIR 并重建向量索引">重建索引</button>
+        <input id="sq" type="search" maxlength="120" placeholder="例如：MNN部署、上周的会议记录" aria-label="文件搜索关键词" autocomplete="off">
+        <select id="search-limit" aria-label="最多显示的候选数"><option value="6">6 条</option><option value="12">12 条</option><option value="20">20 条</option></select>
+        <button id="search-btn" class="btn btn-primary">搜索文件</button>
+        <button id="rebuild-file-btn" class="btn btn-ghost" title="重新扫描已配置的文件目录">重建索引</button>
       </div>
       <div id="rebuild-file-result" class="hint-line"></div>
     </div>
@@ -76,7 +84,8 @@
         <textarea id="chat-input" rows="2" maxlength="4000" placeholder="输入消息，Enter 发送 / Shift+Enter 换行"></textarea>
         <div class="chat-side">
           <label class="checkbox-line"><input type="checkbox" id="force-cloud"> force_cloud（直连云端）</label>
-          <button id="chat-send" class="btn btn-primary">发送</button>
+          <button id="chat-search" class="btn btn-ghost" title="用当前输入搜索本地文件，不发送给聊天模型">搜索本地文件</button>
+          <button id="chat-send" class="btn btn-primary">发送（自动判断）</button>
         </div>
       </div>
     </div>
@@ -150,6 +159,6 @@
 </main>
 
 <div id="toast-host"></div>
-<script src="app.js"></script>
+<script type="module" src="app.js?v=web-modules-3"></script>
 </body>
 </html>

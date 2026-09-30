@@ -16,6 +16,10 @@ class ExpenseCollectRequest(BaseModel):
     file_uri: str | None = Field(default=None, description="可选：文件路径/对象链接")
     file_hash: str | None = Field(default=None, description="可选：文件内容 hash，用于增量判重")
     file_size_bytes: int | None = Field(default=None, description="可选：文件大小（字节），用于增量判重")
+    file_mtime_ns: int | None = Field(
+        default=None,
+        description="可选：文件 st_mtime_ns，用于增量判重（与 file_hash/file_size_bytes 同为内部去重元数据）",
+    )
     captured_at: str | None = Field(default=None, description="可选：原始截图/文件时间（ISO 字符串）")
     notes: str | None = Field(default=None, description="可选：额外备注")
 

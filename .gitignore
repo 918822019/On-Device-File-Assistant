@@ -62,6 +62,13 @@ android/local.properties
 *.tqwen
 fake*_hf.pt
 
+# 从仓库根运行 tiny-llm / 端侧引擎时落在 CWD 的运行时目录（仓库里没有任何代码
+# 引用这两个路径，是在仓库根跑二进制时留下的空目录）。Git 本身不跟踪空目录，
+# 所以它们平时不出现在 git status 里 —— 但只要有产物写入就会立刻变成待提交
+# 内容。锚定仓库根，避免误伤别处同名的 tmp/。
+/tmp/
+/prefixcache/
+
 # ---- macOS ----
 .DS_Store
 .AppleDouble

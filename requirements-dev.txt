@@ -1,2 +1,6 @@
 # 开发/测试依赖（运行时依赖见 requirements.txt）
 pytest>=8.0
+# 静态检查入口，配置见 ruff.toml，通过 `make lint` 运行。
+# 注意能力边界：ruff/pyflakes 只做单文件分析，不跨模块解析导入，抓不到
+# 「from .x import 已被移走的符号」这类错误 —— 那由 tests/test_import_smoke.py 覆盖。
+ruff==0.16.9

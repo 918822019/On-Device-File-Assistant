@@ -102,6 +102,26 @@ class FileActionResponse(BaseModel):
     next_action_suggestions: list[str] = Field(default_factory=list)
 
 
+class IndexedSource(BaseModel):
+    path: str
+    indexed_files: int
+    available: bool
+
+
+class IndexStatusResponse(BaseModel):
+    indexed_files: int
+    scan_recursive: bool
+    scan_interval_seconds: int
+    vector_ready: bool
+    # 查询长度上限，由后端下发给前端设置输入框 maxlength。
+    # 此前前端硬编码 260 而后端静默截断到 120，121~260 字符的尾部线索被无声丢弃，
+    # 用户侧只表现为「搜不准」且没有任何提示。改为随 index-status 下发后，
+    # 上限只有 config 一个事实源，前端不会再与之漂移。
+    max_query_len: int
+    last_indexed_at: str | None = None
+    sources: list[IndexedSource] = Field(default_factory=list)
+
+
 class RebuildIndexResponse(BaseModel):
     scanned: int = 0
     imported: int = 0

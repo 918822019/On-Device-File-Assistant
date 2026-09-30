@@ -1,0 +1,93 @@
+# Ruff 配置 —— `make lint` 的入口。
+#
+# 为什么需要显式 select：ruff 0.16 的默认规则集极宽（A/BLE/C/D/DTZ/S/TRY/PLR/...
+# 几乎全开），直接跑会在本项目产出上百条与刻意设计相冲突的告警，lint 门禁随即
+# 沦为噪音而被绕过。故此处只挑「能指出真实缺陷」的规则族。
+#
+# 能力边界（重要）：ruff/pyflakes 只做单文件分析，**不跨模块解析导入**，因此
+# 抓不到 `from .service import _now_iso` 这种「符号已从目标模块移走」的错误。
+# 历史上正是这类错误让整个应用起不来（10 个模块连锁 ImportError）却无人发现。
+# 该场景由 tests/test_import_smoke.py 覆盖，不要用本配置替代它。
+
+line-length = 120
+target-version = "py310"
+
+exclude = [
+    ".venv",
+    "third_party",   # tiny-llm 子模块，独立仓库，不在本仓库治理范围
+    "models",
+    "data",
+    "**/__pycache__",
+]
+
+[lint]
+select = [
+    "F",        # pyflakes：未使用导入/变量、未定义名 —— 信噪比最高的一组
+    "E", "W",   # pycodestyle
+    "I",        # isort：导入顺序与分组
+    "UP",       # pyupgrade：已过时的写法
+    "B",        # bugbear：真实缺陷模式（可变默认参数、循环变量晚绑定等）
+    "C4",       # comprehensions：不必要的 list()/dict() 构造
+    "SIM",      # simplify：可合并的分支等
+    "RUF",      # ruff 自有规则（RUF012 ClassVar、RUF100 失效的 noqa）
+    "EXE",      # shebang 与文件可执行位是否一致
+    "PLW1510",  # subprocess.run 未显式处理返回码
+]
+
+ignore = [
+    # ---- 与「全链路静默降级」的刻意设计冲突 ----
+    # bootstrap.py 里每个服务装配失败都 except -> None + warning；orchestrator
+    # 吞掉所有 edge/cloud 异常以保证「云端失败绝不抛 500」；deps.record_safe
+    # 保证指标失败绝不影响业务响应。这些宽 except 是设计而非疏忽。
+    # 代价是降级不易察觉，已由 /health 的 degraded + services 明细补偿。
+    "BLE001",   # blind except Exception
+    "S110",     # try-except-pass
+    "S112",     # bare except
+    "TRY401",   # 建议 exception 里不要重复 logger 消息
+
+    # ---- 与「naive UTC 秒精度」的时间口径冲突 ----
+    # 见 common/time_utils.py 模块 docstring：datetime.utcnow() 在 3.12+ 已弃用，
+    # 故统一为 datetime.now(timezone.utc).replace(tzinfo=None)。存储与日志里的
+    # 历史数据都是 naive 格式，改成 aware 会造成新旧数据无法直接比较。
+    "DTZ005",   # datetime.now() 未带 tz
+    "DTZ006",   # datetime.fromtimestamp() 未带 tz
+
+    # ---- 风格取舍 ----
+    # 这是中文代码库：注释、docstring 与面向用户的字符串里的全角标点（：，（）；）
+    # 是正确写法，不是「歧义字符」。RUF001/002/003 会把它们全部标为问题
+    # （实测 1500+ 条纯噪音），必须关闭。
+    "RUF001",   # 字符串中的全角标点
+    "RUF002",   # docstring 中的全角标点
+    "RUF003",   # 注释中的全角标点
+    # 三元表达式会把解释「为什么这样分支」的注释挤掉，本项目多处刻意保留 if/else。
+    "SIM108",
+    # 本项目的 try/except/pass 全都带着「为什么这里可以吞掉」的说明注释，
+    # 换成 contextlib.suppress 只是把同样意图换一种写法，无缺陷收益。
+    "SIM105",
+    # SIM103 建议把 `if bad: return False` + `return True` 折叠成
+    # `return not (a and b)`。本项目一致使用 guard clause 风格（_within_amount /
+    # _within_date / _wanted 等），折叠后可读性反而变差，故不接受该建议。
+    "SIM103",
+    # 与 ruff formatter 冲突，同时启用会互相打架
+    "COM812",
+    "ISC001",
+]
+
+[lint.per-file-ignores]
+# 测试里 assert 就是断言方式，字面量魔法值是可读性优点而非缺陷。
+# C408：fixture 构造器一律是 `base = dict(field=value, ...)` 再 .update(overrides)
+# 后 **base 展开；这种写法免去键的引号、且与数据类构造器签名逐字对应，改成
+# {"field": value} 字面量只会更难读。
+"tests/*" = ["S101", "PLR2004", "B011", "C408"]
+# 脚本的职责就是往 stdout 打印
+"scripts/*" = ["T201", "PLR0912", "PLR0915", "C901"]
+# conftest 需要把 src/ 塞进 sys.path，导入必然不在文件顶部
+"tests/conftest.py" = ["E402"]
+# numpy/faiss 是可选依赖，故意在 _FaissBackend.__init__ 的 try 块里局部导入并存为
+# self._np（所有真实调用都走 self._np）。因此 np 在模块作用域确实不存在，
+# _normalize 的类型注解只能以字符串形式引用它；文件顶部有
+# `from __future__ import annotations`，注解根本不会被求值，运行期无风险。
+"src/edge_cloud_agent/personal_search/vector_index.py" = ["F821", "UP037"]
+# Windows 的环境变量字面量就是 %OneDrive%（混合大小写）。改成大写会让
+# OneDrive 目录探测在 Windows 上直接失效 —— 这是假阳性，不是风格问题。
+"scripts/sources.py" = ["SIM112"]

@@ -1,7 +1,7 @@
 """Configuration helpers for the edge-cloud hybrid agent."""
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -28,13 +28,16 @@ class EdgeConfig:
     """All knobs for the edge (device/local) generation runtime."""
 
     source: str = os.getenv("EDGE_MODEL_SOURCE", "hf")
-    model_id: str = os.getenv("EDGE_MODEL_ID", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    quantized_model_id: str = os.getenv(
-        "EDGE_QUANTIZED_MODEL_ID",
-        "TheBloke/TinyLlama-1.1B-Chat-v1.0-GPTQ",
-    )
+    model_id: str = os.getenv("EDGE_MODEL_ID", "google/gemma-4-E2B-it")
+    # 仅在启用量化时使用，故默认为空。此前默认值是 TinyLlama 的 GPTQ 仓库，
+    # 与 model_id 指向不同模型：一旦有人打开量化，会静默加载完全无关的权重。
+    quantized_model_id: str = os.getenv("EDGE_QUANTIZED_MODEL_ID", "")
     local_cache_dir: str = os.getenv("EDGE_LOCAL_DIR", "")
-    quantization: str = os.getenv("EDGE_QUANTIZATION", "int4-gp32")
+    # none = 按原生精度直接加载（当前推荐）。此前默认 int4-gp32，会让无 .env 的
+    # 新装环境直接走进 GPTQ -> bitsandbytes -> 原精度 的回退链：该链路依赖 CUDA 且
+    # 已弃用（见 README 已知约束 #3 与 docs/KNOWN_ISSUES.md O5），在 CPU/Apple
+    # Silicon 上只是白白多两次失败加载和误导性 warning。
+    quantization: str = os.getenv("EDGE_QUANTIZATION", "none")
     max_input_tokens: int = _env_int("EDGE_MAX_INPUT_TOKENS", 1400)
     max_new_tokens: int = _env_int("EDGE_MAX_NEW_TOKENS", 220)
     temperature: float = _env_float("EDGE_TEMPERATURE", 0.7)
@@ -43,11 +46,12 @@ class EdgeConfig:
     quant_bits: int = _env_int("EDGE_QUANT_BITS", 4)
     quant_group_size: int = _env_int("EDGE_QUANT_GROUP_SIZE", 32)
     use_sampling: bool = _env_bool("EDGE_USE_SAMPLING", True)
-    # 推理设备。auto = 交给 accelerate 决定（Apple Silicon 上会落 MPS）；
-    # 也可显式指定 cpu / mps / cuda:0。
-    # 注意：transformers 5.x 的 SDPA 在 MPS 上会产出 NaN 与非确定性结果，
-    # 本机请设为 cpu，详见 docs/KNOWN_ISSUES.md。
-    device: str = os.getenv("EDGE_DEVICE", "auto")
+    # 推理设备。默认 cpu：auto 会交给 accelerate 决定，在 Apple Silicon 上落到 MPS，
+    # 而 transformers 5.x 的 SDPA 在 MPS 上会产出 NaN 与非确定性结果
+    # （docs/KNOWN_ISSUES.md O1）。cpu 慢但结果正确，作为默认值优于「快但静默出错」；
+    # 有 CUDA 的机器请显式设 EDGE_DEVICE=cuda:0（deploy.sh 在无 nvidia-smi 时本就
+    # 预装 CPU 版 torch）。也可显式指定 mps 自行承担上述风险。
+    device: str = os.getenv("EDGE_DEVICE", "cpu")
     # 权重精度。auto = 沿用模型 config.json 声明的 dtype（gemma-4-E2B 为 bfloat16）；
     # 也可显式指定 bfloat16 / float16 / float32。
     dtype: str = os.getenv("EDGE_DTYPE", "auto")
@@ -63,10 +67,12 @@ class EmbeddingConfig:
     max_length: int = _env_int("EDGE_EMBEDDING_MAX_LENGTH", 512)
     batch_size: int = _env_int("EDGE_EMBEDDING_BATCH_SIZE", 8)
     trust_remote_code: bool = _env_bool("EDGE_EMBEDDING_TRUST_REMOTE_CODE", True)
-    torch_dtype: str = os.getenv("EDGE_EMBEDDING_TORCH_DTYPE", "float16")
-    # 推理设备，取值同 EDGE_DEVICE。transformers 5.x 下 MPS 会导致向量
-    # 非确定性（同一输入多次运行得到不同余弦值），本机请设为 cpu。
-    device: str = os.getenv("EDGE_EMBEDDING_DEVICE", "auto")
+    # bfloat16 = 已验证确定且无 NaN 的取值。float16 在 MPS 上会输出全 NaN 向量；
+    # auto 会读模型 config.json（embeddinggemma-300m 声明 float32，可用但更慢更占内存）。
+    torch_dtype: str = os.getenv("EDGE_EMBEDDING_TORCH_DTYPE", "bfloat16")
+    # 推理设备，取值与约束同 EDGE_DEVICE；默认 cpu，MPS 在 transformers 5.x 下
+    # 会导致向量非确定性（同一输入多次运行得到不同余弦值），会直接污染语义检索。
+    device: str = os.getenv("EDGE_EMBEDDING_DEVICE", "cpu")
 
 
 @dataclass(frozen=True)
@@ -78,7 +84,10 @@ class CloudConfig:
     # 8000 端口，容易被其他服务占用，导致启用云端后请求打到无关服务上。
     api_base: str = os.getenv("CLOUD_API_BASE", "")
     api_key: str = os.getenv("CLOUD_API_KEY", "")
-    model: str = os.getenv("CLOUD_MODEL_ID", "google/gemma-4-e2b-it")
+    # 默认为空，与 CLOUD_API_BASE 同理：云端选型未定，强制使用者显式配置。
+    # 留空时 cloud_client.complete() 会给出明确报错，而不是把 "model": "" 发给
+    # 远端换回一个不透明的 4xx（再被 orchestrator 吞成通用降级提示）。
+    model: str = os.getenv("CLOUD_MODEL_ID", "")
     timeout_seconds: int = _env_int("CLOUD_TIMEOUT_SECONDS", 20)
     max_new_tokens: int = _env_int("CLOUD_MAX_NEW_TOKENS", 512)
     temperature: float = _env_float("CLOUD_TEMPERATURE", 0.5)
@@ -163,6 +172,9 @@ class PersonalFileConfig:
     skip_cloud_placeholders: bool = _env_bool("FILE_MEMORY_SKIP_CLOUD_PLACEHOLDERS", True)
     top_k_default: int = _env_int("FILE_MEMORY_TOP_K_DEFAULT", 8)
     max_search_query_len: int = _env_int("FILE_MEMORY_MAX_QUERY_LEN", 120)
+    # ↑ 这个上限会通过 /v1/search-agent/index-status 的 max_query_len 字段下发给
+    # Web 前端用于设置输入框 maxlength，因此改这里不需要再同步改前端。
+    # （此前前端硬编码 260，后端静默截断到 120，两边长期不一致。）
     # 入库文件内容的截断长度。此前误复用 max_search_query_len（120 字符，
     # 那是"查询"的截断长度），导致文档正文只有开头一小段可被检索。
     raw_text_max_chars: int = _env_int("FILE_MEMORY_RAW_TEXT_MAX_CHARS", 2000)

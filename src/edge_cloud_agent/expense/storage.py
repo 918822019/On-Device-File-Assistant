@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from threading import Lock
-from typing import Iterable
+
+from ..common.jsonl_store import JsonlSnapshotStore
 
 
 @dataclass(frozen=True)
@@ -28,6 +25,10 @@ class ExpenseMaterial:
     file_uri: str | None = None
     file_hash: str | None = None
     file_size_bytes: int | None = None
+    # st_mtime_ns，与 PersonalFileItem.file_mtime_ns 同一用途：watch 循环的廉价
+    # 变更预筛。size 与 mtime 都没变就不必读文件算 hash。旧记录没有该字段
+    # （from_dict 回落 None），会被当作「未知」而重算一次 hash 并就地回填。
+    file_mtime_ns: int | None = None
     notes: str | None = None
     keywords: list[str] = field(default_factory=list)
     created_at: str = ""
@@ -35,7 +36,7 @@ class ExpenseMaterial:
     embedding: list[float] | None = None
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "ExpenseMaterial":
+    def from_dict(cls, payload: dict) -> ExpenseMaterial:
         """容错构造：历史 JSONL 中多出/缺失字段时不整行崩溃（与 personal 侧对齐）。"""
 
         return cls(
@@ -53,6 +54,7 @@ class ExpenseMaterial:
             file_uri=payload.get("file_uri"),
             file_hash=payload.get("file_hash"),
             file_size_bytes=payload.get("file_size_bytes"),
+            file_mtime_ns=payload.get("file_mtime_ns"),
             notes=payload.get("notes"),
             keywords=payload.get("keywords", []) or [],
             created_at=payload.get("created_at", ""),
@@ -64,94 +66,28 @@ class ExpenseMaterial:
         return asdict(self)
 
 
-class ExpenseStore:
-    """JSONL-backed local store (single file), intentionally simple and local-only."""
+class ExpenseStore(JsonlSnapshotStore[ExpenseMaterial]):
+    """报销材料存储：主键 ``material_id``，二级索引 ``file_uri``（可空）。
 
-    def __init__(self, path: str) -> None:
-        self.path = Path(path).resolve()
-        self._items: dict[str, ExpenseMaterial] = {}
-        # file_uri → material_id 索引，避免 get_by_file_uri 每次 O(N) 遍历
-        self._by_file_uri: dict[str, str] = {}
-        self._lock = Lock()
-        self._load()
+    通用的快照读写、原子落盘、二级索引维护都在 ``JsonlSnapshotStore``；这里只
+    留报销业务自己的查询（按报销单聚合）。
 
-    def add_or_update(self, material: ExpenseMaterial, persist: bool = True) -> None:
-        """写入内存索引；persist=False 时延迟落盘（批量导入场景配合 flush 使用）。"""
-        with self._lock:
-            self._items[material.material_id] = material
-            if material.file_uri:
-                self._by_file_uri[material.file_uri] = material.material_id
-            if persist:
-                self._persist()
+    注意 ``ExpenseMaterial.file_uri`` 是 ``str | None``：手工录入的材料没有
+    来源文件，基类对假值不建索引项，因此这类行只能按 ``material_id`` 取。
+    """
 
-    def flush(self) -> None:
-        """将当前内存索引一次性落盘。"""
-        with self._lock:
-            self._persist()
-
-    def get(self, material_id: str) -> ExpenseMaterial | None:
-        return self._items.get(material_id)
+    row_type = ExpenseMaterial
+    id_attr = "material_id"
+    index_attr = "file_uri"
 
     def get_by_file_uri(self, file_uri: str) -> ExpenseMaterial | None:
-        material_id = self._by_file_uri.get(file_uri)
-        if material_id is None:
-            return None
-        return self._items.get(material_id)
+        return self.get_by_index(file_uri)
 
-    def list_all(self) -> list[ExpenseMaterial]:
-        return list(self._items.values())
+    def delete_by_file_uri(self, file_uri: str, persist: bool = True) -> bool:
+        return self.delete_by_index(file_uri, persist=persist)
 
     def list_by_claim(self, claim_id: str) -> list[ExpenseMaterial]:
         return [m for m in self._items.values() if m.claim_id == claim_id]
 
-    def get_many(self, material_ids: Iterable[str]) -> list[ExpenseMaterial]:
-        result: list[ExpenseMaterial] = []
-        for material_id in material_ids:
-            material = self._items.get(material_id)
-            if material is not None:
-                result.append(material)
-        return result
-
-    def delete_by_file_uri(self, file_uri: str, persist: bool = True) -> bool:
-        with self._lock:
-            material_id = self._by_file_uri.pop(file_uri, None)
-            if material_id is None:
-                return False
-            self._items.pop(material_id, None)
-            if persist:
-                self._persist()
-            return True
-
     def all_claim_ids(self) -> list[str]:
         return sorted({m.claim_id for m in self._items.values()})
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            return
-
-        with self.path.open("r", encoding="utf-8") as file:
-            for raw_line in file:
-                row = raw_line.strip()
-                if not row:
-                    continue
-                try:
-                    payload = json.loads(row)
-                    material = ExpenseMaterial.from_dict(payload)
-                    self._items[material.material_id] = material
-                    if material.file_uri:
-                        self._by_file_uri[material.file_uri] = material.material_id
-                except Exception:
-                    # 向后兼容：一行坏数据直接跳过，避免影响服务启动
-                    continue
-
-    def _persist(self) -> None:
-        """原子落盘：先写临时文件再 os.replace，避免中途崩溃留下半截 JSONL。"""
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(self.path.name + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as file:
-            for material in self._items.values():
-                file.write(json.dumps(material.to_dict(), ensure_ascii=False))
-                file.write("\n")
-        os.replace(tmp_path, self.path)

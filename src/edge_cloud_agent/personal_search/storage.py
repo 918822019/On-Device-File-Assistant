@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Iterable
+
+from ..common.file_io import atomic_write_text
+from ..common.jsonl_store import JsonlSnapshotStore
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,10 @@ class PersonalFileItem:
     updated_at: str | None = None
     file_size_bytes: int | None = None
     file_hash: str | None = None
+    # st_mtime_ns，用作周期扫描的廉价变更预筛：size 与 mtime 都没变就不再读文件
+    # 算 hash。旧记录没有该字段（from_dict 回落 None），会被当作「未知」而重算
+    # 一次 hash 并就地回填，不会触发内容重读或重新 embedding。
+    file_mtime_ns: int | None = None
     visual_hints: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     embedding: list[float] | None = None
@@ -34,7 +40,7 @@ class PersonalFileItem:
     last_scanned_at: str = ""
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "PersonalFileItem":
+    def from_dict(cls, payload: dict) -> PersonalFileItem:
         return cls(
             file_id=payload.get("file_id", ""),
             title=payload.get("title", ""),
@@ -49,6 +55,7 @@ class PersonalFileItem:
             updated_at=payload.get("updated_at"),
             file_size_bytes=payload.get("file_size_bytes"),
             file_hash=payload.get("file_hash"),
+            file_mtime_ns=payload.get("file_mtime_ns"),
             visual_hints=payload.get("visual_hints", []) or [],
             tags=payload.get("tags", []) or [],
             embedding=payload.get("embedding"),
@@ -60,100 +67,23 @@ class PersonalFileItem:
         return asdict(self)
 
 
-class PersonalFileStore:
-    """Simple JSONL store for local file index."""
+class PersonalFileStore(JsonlSnapshotStore[PersonalFileItem]):
+    """文件索引存储：主键 ``file_id``，二级索引 ``file_uri``。
 
-    def __init__(self, path: str) -> None:
-        self.path = Path(path).resolve()
-        self._items: dict[str, PersonalFileItem] = {}
-        self._by_file_uri: dict[str, str] = {}
-        self._lock = Lock()
-        self._load()
+    通用的快照读写、原子落盘、二级索引维护都在 ``JsonlSnapshotStore``；这里只
+    提供本业务线的命名别名（``file_uri`` 是这条线的既有公开 API，被 ingest /
+    service / 路由直接调用，不随基类改名）。
+    """
 
-    def add_or_update(self, item: PersonalFileItem, persist: bool = True) -> None:
-        """写入内存索引；persist=False 时延迟落盘（批量导入场景配合 flush 使用）。"""
-
-        with self._lock:
-            prev = self._items.get(item.file_id)
-            if prev is not None and prev.file_uri and prev.file_uri != item.file_uri:
-                # 同一 file_id 的 URI 变化（如格式规范化）后清理旧键，
-                # 防止 _by_file_uri 积累悬空键
-                if self._by_file_uri.get(prev.file_uri) == item.file_id:
-                    del self._by_file_uri[prev.file_uri]
-            self._items[item.file_id] = item
-            self._by_file_uri[item.file_uri] = item.file_id
-            if persist:
-                self._persist()
-
-    def flush(self) -> None:
-        """将当前内存索引一次性落盘。
-
-        此前每条 add_or_update 都全量重写 JSONL，扫描导入 N 个文件 = N 次全量写（O(N^2)）。
-        """
-
-        with self._lock:
-            self._persist()
-
-    def get(self, file_id: str) -> PersonalFileItem | None:
-        return self._items.get(file_id)
+    row_type = PersonalFileItem
+    id_attr = "file_id"
+    index_attr = "file_uri"
 
     def get_by_file_uri(self, file_uri: str) -> PersonalFileItem | None:
-        file_id = self._by_file_uri.get(file_uri)
-        if file_id is None:
-            return None
-        return self._items.get(file_id)
-
-    def list_all(self) -> list[PersonalFileItem]:
-        return list(self._items.values())
-
-    def get_many(self, file_ids: Iterable[str]) -> list[PersonalFileItem]:
-        result: list[PersonalFileItem] = []
-        for file_id in file_ids:
-            material = self._items.get(file_id)
-            if material is not None:
-                result.append(material)
-        return result
+        return self.get_by_index(file_uri)
 
     def delete_by_file_uri(self, file_uri: str, persist: bool = True) -> bool:
-        with self._lock:
-            file_id = self._by_file_uri.get(file_uri)
-            if file_id is None:
-                return False
-            del self._by_file_uri[file_uri]
-            self._items.pop(file_id, None)
-            if persist:
-                self._persist()
-            return True
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            return
-
-        with self.path.open("r", encoding="utf-8") as file:
-            for raw_line in file:
-                row = raw_line.strip()
-                if not row:
-                    continue
-                try:
-                    payload = json.loads(row)
-                    item = PersonalFileItem.from_dict(payload)
-                    if item.file_id:
-                        self._items[item.file_id] = item
-                        self._by_file_uri[item.file_uri] = item.file_id
-                except Exception:
-                    continue
-
-    def _persist(self) -> None:
-        """原子落盘：先写临时文件再 os.replace，进程中途崩溃不会留下半截 JSONL。"""
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(self.path.name + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as file:
-            for item in self._items.values():
-                file.write(json.dumps(item.to_dict(), ensure_ascii=False))
-                file.write("\n")
-        os.replace(tmp_path, self.path)
+        return self.delete_by_index(file_uri, persist=persist)
 
 
 class FileStateStore:
@@ -187,17 +117,11 @@ class FileStateStore:
             self._archived = set()
 
     def _persist(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "annotations": self._annotations,
             "archived": sorted(self._archived),
         }
-        tmp_path = self.path.with_name(self.path.name + ".tmp")
-        tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
-        os.replace(tmp_path, self.path)
+        atomic_write_text(self.path, json.dumps(payload, ensure_ascii=False, indent=1))
 
     def set_annotation(self, file_id: str, note: str) -> None:
         with self._lock:
@@ -214,3 +138,26 @@ class FileStateStore:
 
     def is_archived(self, file_id: str) -> bool:
         return file_id in self._archived
+
+    def prune(self, valid_file_ids: Iterable[str]) -> int:
+        """清理已不在索引中的 file_id 的备注与归档标记，返回清理条数。
+
+        幽灵清理只删 store 里的条目、不会动这里，所以被删文件的备注/归档会永久
+        残留。这不只是无界增长：file_id 由路径 md5 派生（``fm_ + md5(path)[:14]``），
+        同一路径永远得到同一个 id —— 文件被删除后若该路径上出现一个**内容不同**的
+        新文件，旧备注会凭空贴到新文件上，用户看到的是一条与内容无关的历史标记。
+
+        无变化时不落盘，避免每轮扫描都重写一次 JSON。
+        """
+
+        valid = set(valid_file_ids)
+        with self._lock:
+            stale_annotations = [fid for fid in self._annotations if fid not in valid]
+            stale_archived = self._archived - valid
+            if not stale_annotations and not stale_archived:
+                return 0
+            for fid in stale_annotations:
+                del self._annotations[fid]
+            self._archived -= stale_archived
+            self._persist()
+            return len(stale_annotations) + len(stale_archived)

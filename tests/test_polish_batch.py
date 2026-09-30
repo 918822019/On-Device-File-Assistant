@@ -4,17 +4,21 @@ from time import monotonic
 
 import pytest
 
+from edge_cloud_agent.common.text_utils import tokenize
 from edge_cloud_agent.config import PersonalFileConfig
 from edge_cloud_agent.personal_search.ingest import run_once
-from edge_cloud_agent.personal_search.service import (
-    _SearchCandidate,
-    _SearchSession,
-    _SESSION_MAX_COUNT,
-    _source_hit,
-    _tokenize,
-    _VERSION_MARK_RE,
-    PersonalFileSearchService,
+from edge_cloud_agent.personal_search.relevance import (
+    VERSION_MARK_RE,
+    SearchCandidate,
+    extract_source_hints,
+    extract_version_hint,
+    extract_visual_hints,
+    filter_candidates_by_reply,
+    score_item,
+    source_hit,
 )
+from edge_cloud_agent.personal_search.service import PersonalFileSearchService
+from edge_cloud_agent.personal_search.sessions import SESSION_MAX_COUNT, SearchSession
 from edge_cloud_agent.personal_search.storage import PersonalFileItem, PersonalFileStore
 
 
@@ -49,14 +53,15 @@ def service(tmp_path) -> PersonalFileSearchService:
 
 
 def _score(service, item, query):
-    score, _evidence, matched = service._score_item(
+    score, _evidence, matched = score_item(
         item,
         query,
-        _tokenize(query),
-        service._extract_source_hints(query),
-        service._extract_visual_hints(query),
-        service._extract_version_hint(query),
-        None,
+        tokens=tokenize(query),
+        source_hints=extract_source_hints(query),
+        visual_hints=extract_visual_hints(query),
+        version_hint=extract_version_hint(query),
+        query_embedding=None,
+        weights=service.score_weights,
     )
     return score, matched
 
@@ -66,11 +71,11 @@ def _score(service, item, query):
 # ---------------------------------------------------------------------------
 
 def test_version_mark_regex():
-    assert _VERSION_MARK_RE.search("方案v2")
-    assert _VERSION_MARK_RE.search("doc v1.3 final")
-    assert _VERSION_MARK_RE.search("最终版本")
-    assert not _VERSION_MARK_RE.search("video save csv")
-    assert not _VERSION_MARK_RE.search("myvideo2")  # v 前面是字母，不算版本标记
+    assert VERSION_MARK_RE.search("方案v2")
+    assert VERSION_MARK_RE.search("doc v1.3 final")
+    assert VERSION_MARK_RE.search("最终版本")
+    assert not VERSION_MARK_RE.search("video save csv")
+    assert not VERSION_MARK_RE.search("myvideo2")  # v 前面是字母，不算版本标记
 
 
 def test_no_version_bonus_without_intent(service):
@@ -97,21 +102,21 @@ def test_version_bonus_with_intent_and_mark(service):
 # ---------------------------------------------------------------------------
 
 def test_source_hit_aliases():
-    assert _source_hit(["gallery"], "doc_type: image mime: image/png") == ["gallery"]
-    assert _source_hit(["camera"], "source_app: camera") == ["camera"]
-    assert _source_hit(["document"], "mime: application/ms-office") == ["document"]
-    assert _source_hit(["document"], "mime: application/pdf") == ["document"]
-    assert _source_hit(["wechat"], "source_app: local doc_type: file") == []
+    assert source_hit(["gallery"], "doc_type: image mime: image/png") == ["gallery"]
+    assert source_hit(["camera"], "source_app: camera") == ["camera"]
+    assert source_hit(["document"], "mime: application/ms-office") == ["document"]
+    assert source_hit(["document"], "mime: application/pdf") == ["document"]
+    assert source_hit(["wechat"], "source_app: local doc_type: file") == []
 
 
 def test_filter_reply_gallery_alias(service):
     photo = _make_item("fm_p1", "聚餐照片", doc_type="image")
     note = _make_item("fm_n1", "会议纪要", doc_type="file")
     cands = [
-        _SearchCandidate(item=photo, score=0.5, evidence="", matched_clues=[]),
-        _SearchCandidate(item=note, score=0.4, evidence="", matched_clues=[]),
+        SearchCandidate(item=photo, score=0.5, evidence="", matched_clues=[]),
+        SearchCandidate(item=note, score=0.4, evidence="", matched_clues=[]),
     ]
-    kept = service._filter_candidates_by_reply(cands, "相册里那张")
+    kept = filter_candidates_by_reply(cands, "相册里那张")
     assert [c.item.file_id for c in kept] == ["fm_p1"]
 
 
@@ -130,20 +135,20 @@ def test_session_ttl_eviction(service):
     assert service.get_session(sid) is not None
 
     # 人为把会话拨到 TTL 之外，下一次 start_search 应将其淘汰
-    with service._session_lock:
-        for s in service._sessions.values():
+    with service.sessions._lock:
+        for s in service.sessions._sessions.values():
             s.last_access = monotonic() - 31 * 60
     service.start_search("另一个查询", top_k=3)
     assert service.get_session(sid) is None
 
 
 def test_session_capacity_eviction(service):
-    total = _SESSION_MAX_COUNT + 10
-    with service._session_lock:
+    total = SESSION_MAX_COUNT + 10
+    with service.sessions._lock:
         now = monotonic()
         for i in range(total):
             sid = f"fake_{i:04d}"
-            service._sessions[sid] = _SearchSession(
+            service.sessions._sessions[sid] = SearchSession(
                 session_id=sid,
                 query="q",
                 candidates=[],
@@ -151,11 +156,11 @@ def test_session_capacity_eviction(service):
                 last_access=now - (total - i),  # i 越小越旧
             )
     service.start_search("触发淘汰", top_k=3)
-    with service._session_lock:
+    with service.sessions._lock:
         # 淘汰发生在新会话入表之前：210 -> 200，再 +1 个新会话
-        assert len(service._sessions) <= _SESSION_MAX_COUNT + 1
-        assert "fake_0000" not in service._sessions
-        assert f"fake_{total - 1:04d}" in service._sessions
+        assert len(service.sessions._sessions) <= SESSION_MAX_COUNT + 1
+        assert "fake_0000" not in service.sessions._sessions
+        assert f"fake_{total - 1:04d}" in service.sessions._sessions
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +202,8 @@ def test_annotate_missing_file_returns_false(service):
 # ---------------------------------------------------------------------------
 
 def test_extraction_confidence_real_signal():
+    from edge_cloud_agent.expense.presentation import extraction_confidence as _extraction_confidence
     from edge_cloud_agent.expense.storage import ExpenseMaterial
-    from edge_cloud_agent.routers.expense import _extraction_confidence
 
     def mat(**kw):
         base = dict(

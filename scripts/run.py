@@ -78,6 +78,7 @@ def is_venv(python: Path) -> bool:
             [str(python), "-c", "import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)"],
             capture_output=True,
             timeout=30,
+            check=False,  # 探测性质：靠 returncode 判断，非 0 不是错误
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -108,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env["PYTHONPATH"] = build_pythonpath(ROOT_DIR, env.get("PYTHONPATH", ""))
 
-    version = subprocess.run([str(python), "-V"], capture_output=True, text=True)
+    version = subprocess.run([str(python), "-V"], capture_output=True, text=True, check=False)
     print(f"[run.py] python   = {(version.stdout or version.stderr).strip()}")
     print(f"[run.py] venv     = {python}")
     print(f"[run.py] PYTHONPATH = {env['PYTHONPATH']}")
@@ -119,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         [str(python), "-m", "uvicorn", "edge_cloud_agent.main:app", "--host", host, "--port", port],
         env=env,
         cwd=str(ROOT_DIR),
+        check=False,  # 退出码要原样透传给调用方（systemd/nohup），不能在这里抛
     )
     return result.returncode
 
